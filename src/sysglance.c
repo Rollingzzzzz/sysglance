@@ -588,6 +588,24 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
     case WM_ERASEBKGND: return 1;
+    case WM_LBUTTONDOWN:
+        /* drag to move (works when click-through is off) */
+        if (!g_click_through) {
+            ReleaseCapture();
+            SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0);
+            {
+                RECT rc;
+                GetWindowRect(hwnd, &rc);
+                g_wnd_pos.x = rc.left;
+                g_wnd_pos.y = rc.top;
+                SaveSettings();
+            }
+        }
+        return 0;
+    case WM_LBUTTONDBLCLK:
+        /* double-click toggles click-through */
+        ToggleClickThrough(hwnd);
+        return 0;
     case WM_RBUTTONUP:
         if (!g_click_through) ShowMenu(hwnd);
         return 0;
@@ -620,6 +638,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     wc.hInstance = inst;
     wc.lpszClassName = APP_NAME;
     wc.hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
+    wc.style = CS_DBLCLKS;              /* receive double-clicks */
     if (!RegisterClassW(&wc)) return 1;
 
     /* "on desktop" mode: render above the wallpaper, BELOW all windows.

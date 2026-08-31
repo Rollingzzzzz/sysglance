@@ -52,7 +52,7 @@ Or on Windows with [mingw-w64](https://winlibs.com/) / MSYS2 using the same comm
 ## Usage
 
 1. Run `sysglance.exe`. The widget appears top-right; a tray icon appears in the notification area.
-2. **Right-click the tray icon** for the menu:
+2. **Drag** the widget to move it; **double-click** it to toggle click-through (mouse pass-through).
    - *Click-through* — toggle mouse pass-through
    - *Start with Windows* — toggle autostart
    - *Reset position* — snap back to the default corner

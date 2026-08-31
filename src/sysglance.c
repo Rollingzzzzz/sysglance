@@ -622,11 +622,17 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     wc.hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
     if (!RegisterClassW(&wc)) return 1;
 
+    /* "on desktop" mode: render above the wallpaper, BELOW all windows.
+     * Reparent into the desktop icon-view layer (SHELLDLL_DefView,
+     * falling back to Progman) — same technique Rainmeter uses. */
+    HWND desk = FindWindowW(L"SHELLDLL_DefView", NULL);
+    if (!desk) desk = FindWindowW(L"Progman", NULL);
+
     hwnd = CreateWindowExW(
-        WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+        WS_EX_LAYERED | WS_EX_TOOLWINDOW,
         APP_NAME, APP_NAME, WS_POPUP | WS_VISIBLE,
         g_wnd_pos.x, g_wnd_pos.y, WND_W, WND_H,
-        NULL, NULL, inst, NULL);
+        desk, NULL, inst, NULL);
     if (!hwnd) return 1;
 
     SetLayeredWindowAttributes(hwnd, 0, 235, LWA_ALPHA);

@@ -31,6 +31,7 @@ No installer. No runtime. No telemetry. One 270 KB executable.
 - **Network** — live down/up rate **and** total bytes since boot (loopback excluded)
 - **Top 10 processes** — CPU% and RAM per process, so you can finally see *what* is eating your machine
 - **Click-through by default** — the widget never steals focus or blocks clicks; right-click the **tray icon** for options
+- **"On desktop" layer** — sits above the wallpaper but *below every window* (the same reparenting into `SHELLDLL_DefView` / `Progman` that Rainmeter uses), so it never covers your applications
 - **Auto-starts with Windows** (registry Run key; toggle from the tray menu)
 - **Position persistence** — remembers where you dragged it (`HKCU\Software\SysGlance`)
 - **Resolution-independent anchoring** — docks to the top-right cell of a 2x10 grid over the primary screen, so it lands correctly on 1080p, 1440p, 4K and ultrawide alike

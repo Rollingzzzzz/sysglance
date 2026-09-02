@@ -70,6 +70,26 @@ Or on Windows with [mingw-w64](https://winlibs.com/) / MSYS2 using the same comm
 
 `QueryProcessCycleTime` gives the CPU cycles consumed by a process. Comparing consecutive samples and normalizing by the total system cycle delta yields a stable per-process CPU% without requiring elevated privileges or undocumented APIs.
 
+### GPU utilization: what the fix taught us (v1.1)
+
+Three bugs stacked to make GPU % useless, all fixed in `b8c6649`:
+
+1. **Ratchet** — the stored value was only overwritten when the new one was *higher*, so GPU % latched at its all-time high ("stuck at 100%") and could never come back down. Fixed by resetting the value at the start of every sampling cycle.
+2. **Wrong engine filter** — the counter was scoped to `engtype_3D` only. CUDA workloads (machine-learning inference, e.g. Ollama) run on the **Compute** engine and were completely invisible: the widget showed ~1% while the GPU was saturated. Now listens to `\GPU Engine(*)` across all engine types.
+3. **Undefined wildcard read** — `PdhGetFormattedCounterValue` on a wildcard counter is undefined behaviour; replaced with `PdhGetFormattedCounterArrayW` and an explicit max across instances.
+
+The diagnosis was done with `src/gpuprobe.c` — a standalone 100 ms console tool printing the same counter set with a per-instance breakdown. Measure first, then fix; the widget and the probe must agree. `tools/gpu_loadtest.ps1` reproduces the load (Ollama `bge-m3` embedding batches).
+
+## Tested environment
+
+| Component | Detail |
+|---|---|
+| OS | Windows 10/11 x64 (PDH GPU counters require 1709+) |
+| GPU (verified) | **NVIDIA GeForce RTX 2070 SUPER** (driver-reported engine counters incl. Compute) |
+| Load used for verification | Ollama `bge-m3` embedding batches — GPU 80–100%, VRAM ~0.75→1.6 GB, decays back after unload |
+
+The PDH `GPU Engine` counter interface itself is vendor-neutral (NVIDIA, AMD and Intel all expose it on Win10 1709+), so no code path is NVIDIA-specific — but **live verification has only been performed on the NVIDIA GPU above**. Reports from AMD/Intel iGPU systems are welcome via issues.
+
 ## Requirements
 
 - Windows 10 (1709+) or Windows 11, x64

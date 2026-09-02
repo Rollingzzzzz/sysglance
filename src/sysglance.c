@@ -102,6 +102,7 @@ static unsigned long long g_proc_interval_cycles = 0;
 
 /* PDH */
 static PDH_HQUERY   g_q;
+static int g_pdh_fail = 0;                /* consecutive PdhCollectQueryData failures */
 static PDH_HCOUNTER g_c_gpu, g_c_vram, g_c_disk_r, g_c_disk_w, g_c_cpuperf;
 static double g_cpu_max_ghz = 0;   /* from registry HKLM Hardware\...\~MHz */
 static double g_cpu_now_ghz = 0;
@@ -244,7 +245,7 @@ static void InitPDH(void)
 {
     if (PdhOpenQueryW(NULL, 0, &g_q) != ERROR_SUCCESS) return;
     BOOL any = FALSE;
-    if (PdhAddEnglishCounterW(g_q, L"\\GPU Engine(*engtype_3D)\\Utilization Percentage",
+    if (PdhAddEnglishCounterW(g_q, L"\\GPU Engine(*)\\Utilization Percentage",
                               0, &g_c_gpu) == ERROR_SUCCESS) any = TRUE;
     else g_c_gpu = NULL;
     if (PdhAddEnglishCounterW(g_q, L"\\GPU Adapter Memory(*)\\Dedicated Usage",
@@ -280,11 +281,42 @@ static void InitPDH(void)
 static void QueryPDH(void)
 {
     PDH_FMT_COUNTERVALUE v;
-    if (!g_pdh_ok || PdhCollectQueryData(g_q) != ERROR_SUCCESS) return;
 
-    if (g_c_gpu && PdhGetFormattedCounterValue(g_c_gpu, PDH_FMT_DOUBLE, NULL, &v)
-        == ERROR_SUCCESS && v.CStatus == ERROR_SUCCESS && v.doubleValue > g_m.gpu)
-        g_m.gpu = v.doubleValue;
+    /* Fail-safe: PDH data collection keeps failing -> counters gone stale.
+     * After 3 consecutive failures disable PDH entirely so the widget shows
+     * an honest "n/a" instead of a frozen ghost value. */
+    if (!g_pdh_ok) return;
+    if (PdhCollectQueryData(g_q) != ERROR_SUCCESS) {
+        if (++g_pdh_fail >= 3) g_pdh_ok = FALSE;
+        return;
+    }
+    g_pdh_fail = 0;
+
+    /* Reset each cycle: the '>' below then picks the max across counter
+     * instances in THIS sample only (not an all-time high). Without this,
+     * GPU % latches at the highest value ever seen (the "stuck at 100%" bug). */
+    g_m.gpu = 0;
+
+    /* Wildcard counter: must read the instance ARRAY and take the max
+     * ourselves (single-value read on a wildcard counter is undefined).
+     * Same method proven in src/gpuprobe.c. Covers ALL engine types:
+     * 3D, Compute (CUDA/Ollama), Copy, Video... */
+    if (g_c_gpu) {
+        DWORD sz = 0, cnt = 0;
+        PdhGetFormattedCounterArrayW(g_c_gpu, PDH_FMT_DOUBLE, &sz, &cnt, NULL);
+        if (sz) {
+            PPDH_FMT_COUNTERVALUE_ITEM_W arr =
+                (PPDH_FMT_COUNTERVALUE_ITEM_W)malloc(sz);
+            if (arr && PdhGetFormattedCounterArrayW(g_c_gpu, PDH_FMT_DOUBLE,
+                    &sz, &cnt, arr) == ERROR_SUCCESS) {
+                for (DWORD i = 0; i < cnt; i++)
+                    if (arr[i].FmtValue.CStatus == ERROR_SUCCESS &&
+                        arr[i].FmtValue.doubleValue > g_m.gpu)
+                        g_m.gpu = arr[i].FmtValue.doubleValue;
+            }
+            free(arr);
+        }
+    }
 
     if (g_c_vram) {
         DWORD sz = 0, cnt = 0;

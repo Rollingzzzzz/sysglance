@@ -245,11 +245,16 @@ static BOOL RunWaitHidden(const wchar_t *cmdline)
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
     DWORD code = 1;
+    wchar_t buf[1024];
+    /* CreateProcessW may write into lpCommandLine (documented), so hand
+     * it a writable copy — callers pass string literals sometimes */
+    wcsncpy(buf, cmdline, 1023);
+    buf[1023] = 0;
     ZeroMemory(&si, sizeof si);
     si.cb = sizeof si;
     si.dwFlags = STARTF_USESHOWWINDOW;
     si.wShowWindow = SW_HIDE;
-    if (!CreateProcessW(NULL, (LPWSTR)cmdline, NULL, NULL, FALSE,
+    if (!CreateProcessW(NULL, buf, NULL, NULL, FALSE,
                         CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
         return FALSE;
     WaitForSingleObject(pi.hProcess, 10000);

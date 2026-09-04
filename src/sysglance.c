@@ -1,5 +1,5 @@
 /*
- * sysglance v1.5 — a tiny always-on-top system monitor widget for Windows 10/11
+ * sysglance v1.6 — a tiny always-on-top system monitor widget for Windows 10/11
  *
  * Pure Win32 + GDI. Single file. No runtime dependencies. MIT license.
  * Builds with mingw-w64 (x64): see build.sh / README.
@@ -1560,6 +1560,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     wc.hInstance = inst;
     wc.lpszClassName = APP_NAME;
     wc.hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
+    wc.hIcon = LoadIconW(inst, (LPCWSTR)MAKEINTRESOURCEW(1));   /* embedded app icon */
     wc.style = CS_DBLCLKS;              /* receive double-clicks */
     if (!RegisterClassW(&wc)) return 1;
 
@@ -1609,8 +1610,14 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     g_nid.uID = 1;
     g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_nid.uCallbackMessage = WM_TRAYICON;
-    g_nid.hIcon = LoadIconW(NULL, (LPCWSTR)IDI_APPLICATION);
-    wcscpy(g_nid.szTip, L"SysGlance 1.5 — system monitor (right-click)");
+    g_nid.hIcon = (HICON)LoadImageW(GetModuleHandleW(NULL),
+                                    (LPCWSTR)MAKEINTRESOURCEW(1), IMAGE_ICON,
+                                    GetSystemMetrics(SM_CXSMICON),
+                                    GetSystemMetrics(SM_CYSMICON),
+                                    LR_DEFAULTCOLOR);
+    if (!g_nid.hIcon)
+        g_nid.hIcon = LoadIconW(NULL, (LPCWSTR)IDI_APPLICATION);
+    wcscpy(g_nid.szTip, L"SysGlance 1.6 — system monitor (right-click)");
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {

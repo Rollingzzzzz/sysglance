@@ -5,8 +5,8 @@ gcc=x86_64-w64-mingw32-gcc
 command -v $gcc >/dev/null 2>&1 || gcc=gcc   # MSYS2/winlibs native
 wr=$(command -v x86_64-w64-mingw32-windres 2>/dev/null || command -v windres)
 
-# embed the requireAdministrator manifest (ETW needs elevation)
-$wr -O coff src/sysglance.rc -o sysglance.res.o
+# embed the icon and the requireAdministrator manifest (ETW needs elevation)
+$wr -O coff -I src src/sysglance.rc -o sysglance.res.o
 
 $gcc -O2 -Wall -municode -mwindows \
     -D_WIN32_WINNT=0x0601 -DNTDDI_VERSION=0x06010000 \

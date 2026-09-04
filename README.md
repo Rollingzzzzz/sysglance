@@ -1,8 +1,10 @@
 # SysGlance
 
+![icon](icon.png)
+
 A tiny, dependency-free system monitor widget for **Windows 10/11** — pure Win32 + GDI in a single C file. It docks in the top-right corner of your screen and shows, at a glance, everything your machine is doing right now — **including who it is talking to on the network**.
 
-No installer. No runtime. No telemetry. One ~115 KB executable.
+No installer. No runtime. No telemetry. One ~130 KB executable.
 
 ```
  ┌─────────────────────────────────────────┐
@@ -131,6 +133,7 @@ The diagnosis was done with `src/gpuprobe.c` — a standalone 100 ms console too
 
 ## Changelog
 
+- **v1.6** — application & tray icon: the widget's visual identity in miniature — dark rounded box, green activity sparkline with fill, cyan live dot (and a thin blue RAM line at larger sizes). Generated from `tools/make_icon.py` (pure Python, no dependencies, 4× supersampled) into `src/sysglance.ico` (16–256 px) and embedded via `src/sysglance.rc`.
 - **v1.5** — resize grips on **all eight** edges/corners (left edge included); TOP CONNECTIONS rows stretch with the window width exactly like TOP PROCESSES (address column grows, the ↓/↑ byte columns stay flush right); rows still without ETW bytes are filled from the **live TCP table** (dim gray, `-` placeholders) so the section always fills its space; fixed a startup crash where `%-*.*ls` followed by further `%ls` arguments trips a bug in this CRT's wide printf (now padded manually — verified with an isolated repro).
 - **v1.4** — manual resizing: with click-through off, grab the right/bottom edges or the bottom-right corner (double-click the widget to toggle click-through). Extra height first adds list rows (5–30 per section), then thickens the graphs; extra width stretches the sparklines and the process-path column. Size is persisted (W/H) and "Reset position" also restores the default size; minimum size enforced during the drag.
 - **v1.3** — sparkline graphs (1 minute) under every metric in per-metric colors; **TOP CONNECTIONS**: per-remote-IP ↓/↑ byte counters with process names over TCP *and* UDP/QUIC via ETW Kernel-Network (raw payload parsing — TDH can't decode these classic events; layouts verified with `src/netprobe.c`); top lists grown to 15+15; process rows now show the shortened executable path spanning the window width; window widened to 500 px; `requireAdministrator` manifest + logon scheduled task autostart (ETW needs elevation; see the antivirus note).

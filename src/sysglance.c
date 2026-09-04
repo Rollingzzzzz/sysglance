@@ -42,6 +42,8 @@
 #include <psapi.h>
 #include <initguid.h>
 #include <dxgi.h>
+#include <evntrace.h>
+#include <evntcons.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <wchar.h>
@@ -52,12 +54,27 @@
 #define INTERVAL_MS     500
 #define GRID_COLS       2
 #define GRID_ROWS       10
-#define TOP_N           10
-#define HDR_LINES       8
+#define TOP_N           15
+#define CONN_N          15         /* TOP CONNECTIONS rows               */
+
+/* sparkline history: 120 samples x 500 ms = 1 minute */
+#define HIST_N          120
+
+/* series indices into g_hist[] */
+enum { H_CPU, H_RAM, H_GPU, H_VRAM, H_DISK_R, H_DISK_W, H_NET_D, H_NET_U, H_COUNT };
 
 /* window metrics: computed once at startup from the system DPI
  * (base values are for 96 dpi / 100%) */
-static int LINE_H, PAD, WND_W, WND_H;
+static int LINE_H, PAD, WND_W, WND_H, GRAPH_H, GAP;
+
+/* per-metric colors: label text == sparkline color */
+static COLORREF C_CPU_L,  C_CPU_F;    /* line, fill */
+static COLORREF C_RAM_L,  C_RAM_F;
+static COLORREF C_GPU_L,  C_GPU_F;
+static COLORREF C_VRAM_L, C_VRAM_F;
+static COLORREF C_DSKR_L, C_DSKW_L, C_DSK_F;
+static COLORREF C_NETD_L, C_NETU_L, C_NET_F;
+static COLORREF C_TEXT, C_SEP;
 
 /* ---------------- state ---------------- */
 
@@ -74,6 +91,7 @@ typedef struct {
 typedef struct {
     DWORD    pid;
     wchar_t  name[32];
+    wchar_t  path[44];     /* drive + ... + tail, or plain name if unknown */
     double   cpu;
     size_t   ram_mb;
 } ProcInfo;
@@ -83,6 +101,38 @@ static DWORD g_cpu_cores = 1;            /* logical processors */
 static double g_vram_total_mb = 0;      /* from DXGI, 0 = unknown */
 static ProcInfo g_top[TOP_N];
 static int      g_top_count;
+
+/* pid -> exe name cache, refreshed by QueryTopProcs every tick;
+ * used to label TOP CONNECTIONS rows */
+typedef struct { DWORD pid; wchar_t name[20]; } PidName;
+static PidName g_pidnames[700];
+static int     g_pidnames_n;
+
+static const wchar_t *PidNameLookup(DWORD pid)
+{
+    for (int i = 0; i < g_pidnames_n; i++)
+        if (g_pidnames[i].pid == pid) return g_pidnames[i].name;
+    return L"?";
+}
+
+/* Shorten a full executable path to <= max chars while keeping the
+ * informative ends: drive letter + "..." + the tail (which always ends
+ * in the exe name). "C:\Program Files\Mozilla Firefox\firefox.exe" (46)
+ * becomes e.g. "C:\...a Firefox\firefox.exe". */
+static void ShortenPath(const wchar_t *full, wchar_t *out, int max)
+{
+    size_t len = wcslen(full);
+    if (len <= (size_t)max) {
+        wcsncpy(out, full, max - 1);
+        out[max - 1] = 0;
+        return;
+    }
+    wcsncpy(out, full, 2);                 /* drive: "C:"          */
+    out[2] = 0;
+    wcscat(out, L"\\...");
+    wcsncat(out, full + len - (max - 6), (size_t)max - 6 - 1);
+    out[max - 1] = 0;
+}
 
 static BOOL  g_click_through = TRUE;
 static POINT g_wnd_pos      = { -1, -1 };
@@ -120,6 +170,13 @@ static PDH_HCOUNTER g_c_gpu, g_c_vram, g_c_disk_r, g_c_disk_w, g_c_cpuperf;
 static double g_cpu_max_ghz = 0;   /* from registry HKLM Hardware\...\~MHz */
 static double g_cpu_now_ghz = 0;
 static int g_pdh_ok = 0;
+
+/* sparkline history: oldest sample at [0]; pushed every timer tick */
+static double g_hist[H_COUNT][HIST_N];
+static int    g_hist_n;
+/* adaptive y-scale for rate graphs (DSK/NET): peak*1.25, decays slowly
+ * so the scale breathes instead of twitching */
+static double g_scale_disk = 8.0, g_scale_net = 8.0;   /* in KB/s */
 
 /* ---------------- persistence ---------------- */
 
@@ -165,31 +222,70 @@ static void SaveSettings(void)
     }
 }
 
+/* Autostart for an elevated widget: the HKCU Run key cannot launch
+ * requireAdministrator apps, so we use a logon scheduled task with
+ * "run with highest privileges" (elevated at logon, no UAC prompt).
+ * The old Run-key entry (v1.2 and earlier) is migrated away. */
+
+static BOOL RunWaitHidden(const wchar_t *cmdline)
+{
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    DWORD code = 1;
+    ZeroMemory(&si, sizeof si);
+    si.cb = sizeof si;
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    if (!CreateProcessW(NULL, (LPWSTR)cmdline, NULL, NULL, FALSE,
+                        CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
+        return FALSE;
+    WaitForSingleObject(pi.hProcess, 10000);
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return code == 0;
+}
+
 static void SetAutoStart(BOOL enable)
 {
-    HKEY k;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER,
-            L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
-            0, KEY_SET_VALUE, &k) != ERROR_SUCCESS) return;
-    if (enable) {
-        wchar_t path[MAX_PATH * 2];
-        GetModuleFileNameW(NULL, path, MAX_PATH);
-        RegSetValueExW(k, APP_NAME, 0, REG_SZ, (LPBYTE)path,
-                       (DWORD)((wcslen(path) + 1) * sizeof(wchar_t)));
-    } else RegDeleteValueW(k, APP_NAME);
-    RegCloseKey(k);
+    wchar_t path[MAX_PATH * 2], cmd[MAX_PATH * 4];
+    GetModuleFileNameW(NULL, path, MAX_PATH);
+    if (enable)
+        swprintf(cmd, MAX_PATH * 4,
+                 L"schtasks /Create /F /TN \"SysGlance\" /TR \"\\\"%ls\\\"\" /SC ONLOGON /RL HIGHEST",
+                 path);
+    else
+        swprintf(cmd, MAX_PATH * 4, L"schtasks /Delete /F /TN \"SysGlance\"");
+    RunWaitHidden(cmd);
+    /* migrate away the legacy Run-key autostart if present */
+    {
+        HKEY k;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER,
+                L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                0, KEY_SET_VALUE, &k) == ERROR_SUCCESS) {
+            RegDeleteValueW(k, APP_NAME);
+            RegCloseKey(k);
+        }
+    }
 }
 
 static BOOL GetAutoStart(void)
 {
-    HKEY k; BOOL on = FALSE;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER,
-            L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
-            0, KEY_QUERY_VALUE, &k) == ERROR_SUCCESS) {
-        on = RegQueryValueExW(k, APP_NAME, NULL, NULL, NULL, NULL) == ERROR_SUCCESS;
-        RegCloseKey(k);
+    SHELLEXECUTEINFOW sei;
+    ZeroMemory(&sei, sizeof sei);
+    sei.cbSize = sizeof sei;
+    sei.fMask = SEE_MASK_NOASYNC;    /* synchronous */
+    sei.lpFile = L"schtasks";
+    sei.lpParameters = L"/Query /TN \"SysGlance\"";
+    sei.nShow = SW_HIDE;
+    if (!ShellExecuteExW(&sei)) return FALSE;
+    WaitForSingleObject(sei.hProcess, 5000);
+    {
+        DWORD code = 1;
+        GetExitCodeProcess(sei.hProcess, &code);
+        CloseHandle(sei.hProcess);
+        return code == 0;
     }
-    return on;
 }
 
 
@@ -428,6 +524,8 @@ static void QueryTopProcs(void)
 
     ProcInfo list[512];
 
+    g_pidnames_n = 0;   /* refresh pid->name cache for the conn section */
+
     snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return;
 
@@ -438,6 +536,8 @@ static void QueryTopProcs(void)
             double cpu = 0;
             size_t ram = 0;
             HANDLE h;
+            wchar_t full[MAX_PATH] = L"";
+            int have_path = 0;
 
             if (n >= 512) break;
             if (pe.th32ProcessID == 0) continue;   /* Idle: would top every list */
@@ -446,6 +546,9 @@ static void QueryTopProcs(void)
             if (h) {
                 FILETIME crea, exit, krn, usr;
                 PROCESS_MEMORY_COUNTERS pmc;
+                DWORD psz = MAX_PATH;
+                if (QueryFullProcessImageNameW(h, 0, full, &psz))
+                    have_path = 1;
                 if (GetProcessTimes(h, &crea, &exit, &krn, &usr))
                     t = FT2U(krn) + FT2U(usr);
                 if (GetProcessMemoryInfo(h, &pmc, sizeof pmc))
@@ -472,9 +575,22 @@ static void QueryTopProcs(void)
             list[n].pid = pe.th32ProcessID;
             wcsncpy(list[n].name, pe.szExeFile, 31);
             list[n].name[31] = 0;
+            if (have_path)
+                ShortenPath(full, list[n].path, 40);
+            else {
+                wcsncpy(list[n].path, pe.szExeFile, 43);
+                list[n].path[43] = 0;
+            }
             list[n].cpu = cpu;
             list[n].ram_mb = ram;
             n++;
+
+            if (g_pidnames_n < 700) {
+                g_pidnames[g_pidnames_n].pid = pe.th32ProcessID;
+                wcsncpy(g_pidnames[g_pidnames_n].name, pe.szExeFile, 19);
+                g_pidnames[g_pidnames_n].name[19] = 0;
+                g_pidnames_n++;
+            }
         } while (Process32NextW(snap, &pe));
     }
     CloseHandle(snap);
@@ -493,7 +609,7 @@ static void QueryTopProcs(void)
     for (i = 0; i < g_top_count; i++) g_top[i] = list[i];
 }
 
-/* ---------------- rendering ---------------- */
+/* ---------------- byte/address formatting ---------------- */
 
 static void fmt_bytes(unsigned long long b, wchar_t *out, size_t n)
 {
@@ -503,10 +619,368 @@ static void fmt_bytes(unsigned long long b, wchar_t *out, size_t n)
     else swprintf(out, n, L"%.1f KB", b / 1024.0);
 }
 
+/* format remote address (v4 dotted / v6 zero-compressed) + port */
+static void fmt_addr(const unsigned char *a, int is_v6, unsigned short port,
+                     wchar_t *out, size_t n)
+{
+    if (!is_v6) {
+        swprintf(out, n, L"%u.%u.%u.%u:%u", a[0], a[1], a[2], a[3], port);
+        return;
+    }
+    {
+        /* longest zero-run compression (::), e.g. ::1, 2a00::1 */
+        int run = 0, best = 0, bestlen = 0, i;
+        unsigned short g[8];
+        wchar_t *p = out;
+        size_t left = n;
+        for (i = 0; i < 8; i++)
+            g[i] = (unsigned short)((a[2*i] << 8) | a[2*i+1]);
+        for (i = 0; i < 8; i++) {
+            if (g[i] == 0) {
+                run++;
+                if (run > bestlen) { bestlen = run; best = i - run + 1; }
+            } else run = 0;
+        }
+        for (i = 0; i < 8; i++) {
+            wchar_t part[8];
+            if (bestlen >= 2 && i >= best && i < best + bestlen) {
+                if (i == best) { wcscpy(p, L":"); left -= 1; p += 1; }
+                continue;
+            }
+            if (i && *(p - 1) != L':') { wcscpy(p, L":"); p += 1; left -= 1; }
+            swprintf(part, 8, L"%x", g[i]);
+            wcsncpy(p, part, left - 1);
+            p += wcslen(part);
+        }
+        swprintf(p, 8, L":%u", port);
+    }
+}
+
+/* ---------------- network tracing (ETW) ---------------- */
+
+/* Per-IP traffic via the Microsoft-Windows-Kernel-Network ETW provider:
+ * one event per send/recv carrying PID, byte count and both endpoints —
+ * covers TCP AND UDP/QUIC, unlike the unelevated TCP tables. Needs an
+ * elevated process (the manifest demands it; autostart runs elevated via
+ * a logon scheduled task, so no UAC at boot).
+ *
+ * The ETW consumer thread aggregates into g_conn under g_conn_cs; the UI
+ * thread snapshots each tick (rate smoothing) and never blocks on ETW. */
+
+DEFINE_GUID(GUID_KernelNetwork,
+    0x7dd42a49, 0x5329, 0x4832, 0x8d, 0xfd, 0x43, 0xd9, 0x79, 0x15, 0x3a, 0x88);
+
+#define ETW_SESSION_NAME L"SysGlance NetTrace"
+
+typedef struct {
+    unsigned char addr[16];            /* remote endpoint (network order) */
+    int  is_v6;
+    unsigned long long bin, bout;      /* cumulative since widget start    */
+    unsigned long long pbin, pbout;    /* previous UI snapshot             */
+    double rin, rout;                  /* smoothed rate, KB/s              */
+    DWORD pid;
+    unsigned short port;
+    DWORD last_tick;                   /* tick of last ETW event           */
+} ConnAgg;
+
+static ConnAgg          g_conn[512];
+static int              g_conn_n;
+static DWORD            g_tick;                 /* UI tick counter          */
+static CRITICAL_SECTION g_conn_cs;
+
+static TRACEHANDLE g_trace_session;             /* StartTrace handle        */
+static TRACEHANDLE g_trace_consumer;            /* OpenTrace handle         */
+static volatile LONG g_etw_state;               /* 0 off, 1 on, 2 denied    */
+
+/* Event payload layouts, verified on Win10 19045 with src/netprobe.c
+ * (TDH cannot decode these classic kernel events — rc=87 — but the raw
+ * bytes are stable and self-describing by size):
+ *
+ *   v4 data event (28 bytes, or 36 with trailing seq/rtt):
+ *     PID(4,LE) size(4,LE) raddr(4) laddr(4) rport(2,BE) lport(2,BE) ...
+ *   v6 data event (52 bytes):
+ *     PID(4,LE) size(4,LE) raddr(16) laddr(16) rport(2,BE) lport(2,BE) ...
+ *
+ * IDs: 10=TCP send, 11=TCP recv, 43=UDP send, 42=UDP recv, 59=UDPv6 send.
+ * 18 = TCP copy (retransmit accounting — counting it would double-count,
+ * so it is excluded). Addresses are ALWAYS remote-first, which saves us
+ * from guessing the direction from our own interface list. */
+static void WINAPI NetEventCallback(PEVENT_RECORD rec)
+{
+    unsigned char ev = (unsigned char)rec->EventHeader.EventDescriptor.Id;
+    const unsigned char *ud = (const unsigned char *)rec->UserData;
+    ULONG len = rec->UserDataLength;
+    int is_send, is_v6, i;
+    ULONG pid, size;
+    const unsigned char *raddr;
+    unsigned short rport;
+    ConnAgg *c;
+
+    if (ev == 10 || ev == 43 || ev == 59) is_send = 1;        /* TCP/UDP send */
+    else if (ev == 11 || ev == 42) is_send = 0;               /* recv         */
+    else return;                                              /* copy, ctl... */
+
+    if (len == 28 || len == 36) is_v6 = 0;
+    else if (len == 52)         is_v6 = 1;
+    else return;
+
+    size = *(const ULONG *)(ud + 4);
+    if (size == 0) return;
+    pid = *(const ULONG *)(ud + 0);
+    raddr = ud + 8;
+    rport = is_v6 ? (unsigned short)((ud[40] << 8) | ud[41])
+                  : (unsigned short)((ud[16] << 8) | ud[17]);
+
+    EnterCriticalSection(&g_conn_cs);
+    c = NULL;
+    for (i = 0; i < g_conn_n; i++)
+        if (g_conn[i].is_v6 == is_v6 &&
+            !memcmp(g_conn[i].addr, raddr, is_v6 ? 16 : 4)) { c = &g_conn[i]; break; }
+    if (!c && g_conn_n < 512) {
+        c = &g_conn[g_conn_n++];
+        ZeroMemory(c, sizeof *c);
+        c->is_v6 = is_v6;
+        memcpy(c->addr, raddr, is_v6 ? 16 : 4);
+    }
+    if (c) {
+        if (is_send) c->bout += size;
+        else         c->bin  += size;
+        c->pid = pid;
+        c->port = rport;
+        c->last_tick = g_tick;
+    }
+    LeaveCriticalSection(&g_conn_cs);
+}
+
+static DWORD WINAPI EtwConsumeThread(LPVOID arg)
+{
+    (void)arg;
+    ProcessTrace(&g_trace_consumer, 1, NULL, NULL);  /* runs until stopped */
+    return 0;
+}
+
+static void StartNetTrace(void)
+{
+    EVENT_TRACE_PROPERTIES *prop;
+    ULONG bufsz = sizeof(EVENT_TRACE_PROPERTIES) + (wcslen(ETW_SESSION_NAME) + 1) * sizeof(wchar_t) * 2;
+    EVENT_TRACE_LOGFILEW lf;
+    ULONG err;
+
+    prop = calloc(1, bufsz);
+    if (!prop) return;
+    prop->Wnode.BufferSize = bufsz;
+    prop->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
+    prop->Wnode.ClientContext = 1;                 /* QPC timestamps   */
+    prop->LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
+    prop->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
+
+    ControlTraceW(0, ETW_SESSION_NAME, prop, EVENT_TRACE_CONTROL_STOP);
+    ZeroMemory(prop, bufsz);
+    prop->Wnode.BufferSize = bufsz;
+    prop->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
+    prop->Wnode.ClientContext = 1;
+    prop->LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
+    prop->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
+
+    err = StartTraceW(&g_trace_session, ETW_SESSION_NAME, prop);
+    if (err == ERROR_ACCESS_DENIED) { g_etw_state = 2; free(prop); return; }
+    if (err != ERROR_SUCCESS)       { free(prop); return; }
+
+    /* 0 keywords = everything the provider offers (TCP, UDP, flow...) */
+    if (EnableTraceEx2(g_trace_session, &GUID_KernelNetwork,
+                       EVENT_CONTROL_CODE_ENABLE_PROVIDER, TRACE_LEVEL_VERBOSE,
+                       0, 0, 0, NULL) != ERROR_SUCCESS) {
+        ControlTraceW(0, ETW_SESSION_NAME, prop, EVENT_TRACE_CONTROL_STOP);
+        free(prop);
+        return;
+    }
+    free(prop);
+
+    ZeroMemory(&lf, sizeof lf);
+    lf.LoggerName = (LPWSTR)ETW_SESSION_NAME;
+    lf.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
+    lf.EventCallback = (PEVENT_CALLBACK)NetEventCallback;  /* header type is
+                                    * the legacy EVENT_TRACE one; with
+                                    * MODE_EVENT_RECORD the callback
+                                    * actually receives PEVENT_RECORD */
+    g_trace_consumer = OpenTraceW(&lf);
+    if (g_trace_consumer == INVALID_PROCESSTRACE_HANDLE) return;
+
+    if (CreateThread(NULL, 0, EtwConsumeThread, NULL, 0, NULL))
+        g_etw_state = 1;
+}
+
+static void StopNetTrace(void)
+{
+    EVENT_TRACE_PROPERTIES *prop;
+    ULONG bufsz = sizeof(EVENT_TRACE_PROPERTIES) + 256 * sizeof(wchar_t);
+    if (g_trace_consumer) CloseTrace(g_trace_consumer);
+    prop = calloc(1, bufsz);
+    if (prop) {
+        prop->Wnode.BufferSize = bufsz;
+        ControlTraceW(0, ETW_SESSION_NAME, prop, EVENT_TRACE_CONTROL_STOP);
+        free(prop);
+    }
+}
+
+/* UI tick: update smoothed rates from cumulative counters */
+static void ConnTick(void)
+{
+    int i;
+    double secs = INTERVAL_MS / 1000.0;
+    g_tick++;
+    if (g_etw_state != 1) return;
+    EnterCriticalSection(&g_conn_cs);
+    for (i = 0; i < g_conn_n; i++) {
+        ConnAgg *c = &g_conn[i];
+        double di = (double)(c->bin  - c->pbin)  / secs / 1024.0;
+        double dou = (double)(c->bout - c->pbout) / secs / 1024.0;
+        c->rin  = c->rin  * 0.5 + di  * 0.5;
+        c->rout = c->rout * 0.5 + dou * 0.5;
+        c->pbin = c->bin;
+        c->pbout = c->bout;
+    }
+    LeaveCriticalSection(&g_conn_cs);
+}
+
+/* draw the TOP CONNECTIONS rows (called from DrawWindow) */
+static void ConnDraw(HDC dc, int y)
+{
+    wchar_t line[160], a[48], bi[10], bo[10];
+    int order[CONN_N], n = 0, i, j;
+
+    if (g_etw_state == 2) {
+        SetTextColor(dc, RGB(150, 150, 150));
+        TextOutW(dc, PAD, y, L"(run as administrator for network tracing)", 42);
+        return;
+    }
+    if (g_etw_state != 1) {
+        SetTextColor(dc, RGB(150, 150, 150));
+        TextOutW(dc, PAD, y, L"(network tracing unavailable)", 29);
+        return;
+    }
+
+    /* top CONN_N by live rate, ties/broken by cumulative volume */
+    EnterCriticalSection(&g_conn_cs);
+    {
+        int used[512] = {0};
+        for (i = 0; i < CONN_N; i++) {
+            int best = -1;
+            for (j = 0; j < g_conn_n; j++) {
+                if (used[j]) continue;
+                if (best < 0) { best = j; continue; }
+                double a_ = g_conn[j].rin + g_conn[j].rout;
+                double b_ = g_conn[best].rin + g_conn[best].rout;
+                if (a_ > b_ ||
+                    (a_ == b_ && g_conn[j].bin + g_conn[j].bout >
+                                 g_conn[best].bin + g_conn[best].bout))
+                    best = j;
+            }
+            if (best < 0 || g_conn[best].bin + g_conn[best].bout == 0) break;
+            used[best] = 1;
+            order[n++] = best;
+        }
+        for (i = 0; i < n; i++) {
+            ConnAgg *c = &g_conn[order[i]];
+            int live = (g_tick - c->last_tick) < 6;   /* seen in last ~3 s */
+            fmt_addr(c->addr, c->is_v6, c->port, a, 48);
+            fmt_bytes(c->bin, bi, 10);
+            fmt_bytes(c->bout, bo, 10);
+            SetTextColor(dc, live ? RGB(140, 225, 245) : RGB(140, 160, 175));
+            swprintf(line, 160, L"%-12.12ls %-23.23ls v%7ls ^%7ls",
+                     PidNameLookup(c->pid), a, bi, bo);
+            TextOutW(dc, PAD, y, line, (int)wcslen(line));
+            y += LINE_H;
+        }
+        if (n == 0) {
+            SetTextColor(dc, RGB(150, 150, 150));
+            TextOutW(dc, PAD, y, L"(listening...)", 14);
+        }
+    }
+    LeaveCriticalSection(&g_conn_cs);
+}
+
+/* ---------------- rendering ---------------- */
+
+/* push one value onto history series s (oldest at [0]) */
+static void HistPush(int s, double v)
+{
+    double *h = g_hist[s];
+    if (g_hist_n < HIST_N) { h[g_hist_n++] = v; return; }
+    memmove(h, h + 1, (HIST_N - 1) * sizeof h[0]);
+    h[HIST_N - 1] = v;
+}
+
+/* draw one sparkline: filled area (dark shade) + bright line on top.
+ * Samples spread across the full width; scale is fixed (percent series)
+ * or adaptive (rate series — caller picks the max). */
+static void DrawSeries(HDC dc, const RECT *rc, int s, double maxval,
+                       COLORREF line_c, COLORREF fill_c)
+{
+    const double *h = g_hist[s];
+    POINT pts[HIST_N];
+    HGDIOBJ oldpen, oldbr;
+    HPEN pen, nopen;
+    HBRUSH brush;
+    int m = g_hist_n, w, hh, i;
+
+    if (m < 2 || rc->right - rc->left < 8) return;
+    if (maxval <= 0) maxval = 1;
+    w = rc->right - rc->left - 1;
+    hh = rc->bottom - rc->top - 2;
+
+    for (i = 0; i < m; i++) {
+        double v = h[i];
+        if (v < 0) v = 0;
+        if (v > maxval) v = maxval;
+        pts[i].x = rc->left + 1 + (int)((double)w * i / (m - 1));
+        pts[i].y = rc->bottom - 1 - (int)((double)hh * v / maxval);
+    }
+
+    /* fill under the line */
+    {
+        POINT poly[HIST_N + 2];
+        memcpy(poly, pts, sizeof(POINT) * m);
+        poly[m].x = pts[m - 1].x;     poly[m].y = rc->bottom - 1;
+        poly[m + 1].x = pts[0].x;     poly[m + 1].y = rc->bottom - 1;
+        brush = CreateSolidBrush(fill_c);
+        nopen = CreatePen(PS_NULL, 0, 0);
+        oldbr = SelectObject(dc, brush);
+        oldpen = SelectObject(dc, nopen);
+        Polygon(dc, poly, m + 2);
+        SelectObject(dc, oldbr);
+        SelectObject(dc, oldpen);
+        DeleteObject(brush);
+        DeleteObject(nopen);
+    }
+
+    pen = CreatePen(PS_SOLID, 1, line_c);
+    oldpen = SelectObject(dc, pen);
+    Polyline(dc, pts, m);
+    SelectObject(dc, oldpen);
+    DeleteObject(pen);
+}
+
+/* "value line + sparkline below it" for one metric; returns y after gap */
+static int DrawMetric(HDC dc, const RECT *winrc, int y, int series,
+                      const wchar_t *text, double maxval,
+                      COLORREF line_c, COLORREF fill_c)
+{
+    RECT gr;
+    SetTextColor(dc, line_c);
+    TextOutW(dc, PAD, y, text, (int)wcslen(text));
+    y += LINE_H;
+    gr.left = PAD + 2;  gr.top = y + 3;
+    gr.right = winrc->right - PAD - 2;  gr.bottom = y + GRAPH_H - 2;
+    DrawSeries(dc, &gr, series, maxval, line_c, fill_c);
+    return y + GRAPH_H + GAP;
+}
+
 static void DrawWindow(HDC dc, HWND hwnd)
 {
     RECT rc;
-    wchar_t line[128], bin[24], bout[24];
+    wchar_t line[160], bin[24], bout[24];
+    int y = PAD;
     GetClientRect(hwnd, &rc);
 
     FillRect(dc, &rc, g_br_back);
@@ -516,74 +990,128 @@ static void DrawWindow(HDC dc, HWND hwnd)
     fmt_bytes(g_m.net_total_in, bin, 24);
     fmt_bytes(g_m.net_total_out, bout, 24);
 
-    int y = PAD;
-    SetTextColor(dc, RGB(130, 220, 170));
-
-    /* spread out: one metric per line, big values */
-    /* multi-core aware: total capacity = base MHz x cores;
-     * used = total capacity x load (all-cores average) */
+    /* --- CPU: % plus effective/total MHz across all cores --- */
     if (g_cpu_now_ghz > 0) {
         long total_mhz = (long)(g_cpu_max_ghz * 1000.0 * g_cpu_cores);
         long used_mhz  = (long)(total_mhz * g_m.cpu / 100.0);
-        swprintf(line, 128, L"CPU  %3.0f%%  %ld/%ldMHz x%lu",
+        swprintf(line, 160, L"CPU  %3.0f%%  %ld/%ldMHz x%lu",
                  g_m.cpu, used_mhz, total_mhz, g_cpu_cores);
     }
     else
-        swprintf(line, 128, L"CPU  %3.0f%%  x%lu", g_m.cpu, g_cpu_cores);
-    TextOutW(dc, PAD, y, line, (int)wcslen(line)); y += LINE_H;
+        swprintf(line, 160, L"CPU  %3.0f%%  x%lu", g_m.cpu, g_cpu_cores);
+    y = DrawMetric(dc, &rc, y, H_CPU, line, 100.0, C_CPU_L, C_CPU_F);
 
-    swprintf(line, 128, L"RAM  %2.0f%%  %lu/%luG",
+    /* --- RAM --- */
+    swprintf(line, 160, L"RAM  %2.0f%%  %lu/%luG",
              g_m.ram, g_m.ram_used_mb >> 10, g_m.ram_total_mb >> 10);
-    TextOutW(dc, PAD, y, line, (int)wcslen(line)); y += LINE_H;
+    y = DrawMetric(dc, &rc, y, H_RAM, line, 100.0, C_RAM_L, C_RAM_F);
 
+    /* --- GPU --- */
     if (g_m.gpu_ok)
-        swprintf(line, 128, L"GPU  %3.0f%%", g_m.gpu);
+        swprintf(line, 160, L"GPU  %3.0f%%", g_m.gpu);
     else
-        swprintf(line, 128, L"GPU   n/a");
-    TextOutW(dc, PAD, y, line, (int)wcslen(line)); y += LINE_H;
+        swprintf(line, 160, L"GPU   n/a");
+    y = DrawMetric(dc, &rc, y, H_GPU, line, 100.0, C_GPU_L, C_GPU_F);
 
+    /* --- VRAM --- */
     if (g_m.vram_ok && g_vram_total_mb > 0)
-        swprintf(line, 128, L"VRAM %.1f/%.0fG", g_m.vram_mb / 1024.0, g_vram_total_mb / 1024.0);
+        swprintf(line, 160, L"VRAM %.1f/%.0fG", g_m.vram_mb / 1024.0,
+                 g_vram_total_mb / 1024.0);
     else if (g_m.vram_ok)
-        swprintf(line, 128, L"VRAM %.1fG", g_m.vram_mb / 1024.0);
+        swprintf(line, 160, L"VRAM %.1fG", g_m.vram_mb / 1024.0);
     else
-        swprintf(line, 128, L"VRAM  n/a");
-    TextOutW(dc, PAD, y, line, (int)wcslen(line)); y += LINE_H;
-
-    if (g_m.disk_ok)
-        swprintf(line, 128, L"DSK  R %4.0f  W %4.0f K/s",
-                 g_m.disk_r_kbps, g_m.disk_w_kbps);
-    else
-        swprintf(line, 128, L"DSK   n/a");
-    TextOutW(dc, PAD, y, line, (int)wcslen(line)); y += LINE_H;
-
-    swprintf(line, 128, L"NET  v %4.0f  ^ %4.0f K/s",
-             g_m.net_down_kbps, g_m.net_up_kbps);
-    TextOutW(dc, PAD, y, line, (int)wcslen(line)); y += LINE_H;
-
-    swprintf(line, 128, L"     in %-7ls  out %-7ls", bin, bout);
-    TextOutW(dc, PAD, y, line, (int)wcslen(line)); y += LINE_H;
-
-    /* separator strip */
+        swprintf(line, 160, L"VRAM  n/a");
     {
-        RECT strip = { 0, y - PAD / 2, rc.right, y + LINE_H - PAD / 2 };
+        double vpct = 0;
+        if (g_m.vram_ok && g_vram_total_mb > 0)
+            vpct = 100.0 * g_m.vram_mb / g_vram_total_mb;
+        y = DrawMetric(dc, &rc, y, H_VRAM, line, 100.0, C_VRAM_L, C_VRAM_F);
+        (void)vpct;
+    }
+
+    /* --- DSK: two series (R bright, W dimmer), adaptive scale --- */
+    if (g_m.disk_ok) {
+        double peak = 1;
+        for (int i = 0; i < g_hist_n; i++) {
+            if (g_hist[H_DISK_R][i] > peak) peak = g_hist[H_DISK_R][i];
+            if (g_hist[H_DISK_W][i] > peak) peak = g_hist[H_DISK_W][i];
+        }
+        g_scale_disk = peak * 1.25 > g_scale_disk ? peak * 1.25
+                                                   : g_scale_disk * 0.97;
+        swprintf(line, 160, L"DSK  R %4.0f  W %4.0f K/s",
+                 g_m.disk_r_kbps, g_m.disk_w_kbps);
+    }
+    else
+        swprintf(line, 160, L"DSK   n/a");
+    {
+        RECT gr;
+        SetTextColor(dc, C_DSKR_L);
+        TextOutW(dc, PAD, y, line, (int)wcslen(line));
+        y += LINE_H;
+        gr.left = PAD + 2;  gr.top = y + 3;
+        gr.right = rc.right - PAD - 2;  gr.bottom = y + GRAPH_H - 2;
+        DrawSeries(dc, &gr, H_DISK_W, g_scale_disk, C_DSKW_L, C_DSK_F);
+        DrawSeries(dc, &gr, H_DISK_R, g_scale_disk, C_DSKR_L, C_DSK_F);
+        y += GRAPH_H + GAP;
+    }
+
+    /* --- NET: two series (down, up), adaptive scale; totals under it --- */
+    {
+        double peak = 1;
+        RECT gr;
+        for (int i = 0; i < g_hist_n; i++) {
+            if (g_hist[H_NET_D][i] > peak) peak = g_hist[H_NET_D][i];
+            if (g_hist[H_NET_U][i] > peak) peak = g_hist[H_NET_U][i];
+        }
+        g_scale_net = peak * 1.25 > g_scale_net ? peak * 1.25 : g_scale_net * 0.97;
+
+        swprintf(line, 160, L"NET  v %4.0f  ^ %4.0f K/s",
+                 g_m.net_down_kbps, g_m.net_up_kbps);
+        SetTextColor(dc, C_NETD_L);
+        TextOutW(dc, PAD, y, line, (int)wcslen(line));
+        y += LINE_H;
+        gr.left = PAD + 2;  gr.top = y + 3;
+        gr.right = rc.right - PAD - 2;  gr.bottom = y + GRAPH_H - 2;
+        DrawSeries(dc, &gr, H_NET_U, g_scale_net, C_NETU_L, C_NET_F);
+        DrawSeries(dc, &gr, H_NET_D, g_scale_net, C_NETD_L, C_NET_F);
+        y += GRAPH_H;
+
+        swprintf(line, 160, L"     in %-8ls  out %-8ls", bin, bout);
+        SetTextColor(dc, C_SEP);
+        TextOutW(dc, PAD, y, line, (int)wcslen(line));
+        y += LINE_H + GAP;
+    }
+
+    /* --- TOP PROCESSES --- */
+    {
+        RECT strip = { 0, y - GAP / 2, rc.right, y + LINE_H - GAP / 2 };
         FillRect(dc, &strip, g_br_hdr);
     }
-    SetTextColor(dc, RGB(120, 165, 190));
+    SetTextColor(dc, C_SEP);
     TextOutW(dc, PAD, y, L"TOP PROCESSES", 13); y += LINE_H;
 
     SelectObject(dc, g_font_proc);
     for (int i = 0; i < g_top_count; i++) {
-        /* highlight busy processes so they catch the eye */
         if (g_top[i].cpu >= 70)      SetTextColor(dc, RGB(250, 120, 110));
         else if (g_top[i].cpu >= 30) SetTextColor(dc, RGB(240, 170, 120));
         else                         SetTextColor(dc, RGB(210, 220, 230));
-        /* name (truncated) left, cpu% right-aligned — roomy layout */
-        swprintf(line, 128, L"%-18.18ls %3.0f%% %5luM",
-                 g_top[i].name, g_top[i].cpu, (unsigned long)g_top[i].ram_mb);
+        /* shortened path spans the window; exe name sits at its tail */
+        swprintf(line, 160, L"%-40.40ls %3.0f%% %5luM",
+                 g_top[i].path, g_top[i].cpu, (unsigned long)g_top[i].ram_mb);
         TextOutW(dc, PAD, y, line, (int)wcslen(line));
         y += LINE_H;
     }
+    y += GAP;
+
+    /* --- TOP CONNECTIONS --- */
+    {
+        RECT strip = { 0, y - GAP / 2, rc.right, y + LINE_H - GAP / 2 };
+        FillRect(dc, &strip, g_br_hdr);
+    }
+    SetTextColor(dc, C_SEP);
+    TextOutW(dc, PAD, y, L"TOP CONNECTIONS", 15); y += LINE_H;
+
+    ConnDraw(dc, y);
 }
 
 /* ---------------- window ---------------- */
@@ -645,6 +1173,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         QueryPDH();
         QueryNet();
         QueryTopProcs();
+        HistPush(H_CPU, g_m.cpu);
+        HistPush(H_RAM, g_m.ram);
+        HistPush(H_GPU, g_m.gpu_ok ? g_m.gpu : 0);
+        HistPush(H_VRAM, (g_m.vram_ok && g_vram_total_mb > 0)
+                          ? 100.0 * g_m.vram_mb / g_vram_total_mb : 0);
+        HistPush(H_DISK_R, g_m.disk_ok ? g_m.disk_r_kbps : 0);
+        HistPush(H_DISK_W, g_m.disk_ok ? g_m.disk_w_kbps : 0);
+        HistPush(H_NET_D, g_m.net_down_kbps);
+        HistPush(H_NET_U, g_m.net_up_kbps);
+        ConnTick();
         InvalidateRect(hwnd, NULL, FALSE);
         return 0;
     case WM_PAINT: {
@@ -707,6 +1245,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_DESTROY:
         KillTimer(hwnd, TIMER_ID);
         SaveSettings();
+        StopNetTrace();
         if (g_pdh_ok) PdhCloseQuery(g_q);
         PostQuitMessage(0);
         return 0;
@@ -734,11 +1273,32 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
         HDC sdc = GetDC(NULL);
         double k = GetDeviceCaps(sdc, LOGPIXELSX) / 96.0;
         ReleaseDC(NULL, sdc);
-        LINE_H = (int)(22.0 * k + 0.5);
-        PAD    = (int)(8.0  * k + 0.5);
-        WND_W  = (int)(340.0 * k + 0.5);
-        WND_H  = PAD * 2 + (HDR_LINES + TOP_N) * LINE_H;
+        LINE_H  = (int)(22.0 * k + 0.5);
+        PAD     = (int)(8.0  * k + 0.5);
+        GRAPH_H = (int)(32.0 * k + 0.5);
+        GAP     = (int)(6.0  * k + 0.5);
+        WND_W   = (int)(500.0 * k + 0.5);   /* wide enough for the
+                                             * conn rows' byte columns */
+        WND_H   = PAD * 2
+                + 6 * (LINE_H + GRAPH_H + GAP)   /* metric line + graph  */
+                + LINE_H                          /* NET totals           */
+                + LINE_H + TOP_N * LINE_H         /* TOP PROCESSES        */
+                + LINE_H + CONN_N * LINE_H;       /* TOP CONNECTIONS      */
     }
+
+    /* per-metric palette: label text == sparkline color */
+    C_CPU_L  = RGB(120, 225, 160); C_CPU_F  = RGB(20, 46, 34);
+    C_RAM_L  = RGB(110, 175, 250); C_RAM_F  = RGB(18, 34, 54);
+    C_GPU_L  = RGB(250, 180, 90);  C_GPU_F  = RGB(52, 36, 16);
+    C_VRAM_L = RGB(195, 145, 250); C_VRAM_F = RGB(40, 28, 58);
+    C_DSKR_L = RGB(240, 225, 100); C_DSKW_L = RGB(235, 150, 80);
+    C_DSK_F  = RGB(44, 40, 14);
+    C_NETD_L = RGB(95, 225, 245);  C_NETU_L = RGB(250, 140, 190);
+    C_NET_F  = RGB(16, 40, 46);
+    C_TEXT   = RGB(210, 220, 230);
+    C_SEP    = RGB(120, 165, 190);
+
+    InitializeCriticalSection(&g_conn_cs);
 
     QueryPerformanceFrequency(&g_qpc_freq);   /* for per-process CPU deltas */
 
@@ -756,6 +1316,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 
     InitPDH();
     InitHardwareInfo();
+    StartNetTrace();
 
     g_msg_taskbar = RegisterWindowMessageW(L"TaskbarCreated");
 

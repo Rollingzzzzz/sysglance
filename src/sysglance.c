@@ -1,5 +1,5 @@
 /*
- * sysglance v2 — a tiny always-on-top system monitor widget for Windows 10/11
+ * sysglance v1.2 — a tiny always-on-top system monitor widget for Windows 10/11
  *
  * Pure Win32 + GDI. Single file. No runtime dependencies. MIT license.
  * Builds with mingw-w64 (x64): see build.sh / README.
@@ -12,22 +12,27 @@
  *   Disk read/write  - PDH "PhysicalDisk" counters (bytes/s)
  *   NET down/up      - GetIfTable2 byte deltas; totals since boot
  *   Top processes    - per-process CPU% and RAM, top 10 by CPU
+ *                      (GetProcessTimes deltas / wall clock x cores)
  *
  * Window behaviour:
  *   - Docks into the top-right cell of a 2x10 grid of the primary screen
  *     (resolution independent: 1080p, 4K, ultrawide all work)
+ *   - DPI-aware: font and widget scale with the system DPI
  *   - Click-through by default (mouse passes to windows below)
  *   - Tray icon right-click: menu (Exit, Click-through toggle, Auto-start)
- *   - Position persisted in HKCU\Software\SysGlance
+ *   - Single instance (named mutex): autostart + manual launch never stack
+ *   - Re-adds its tray icon when explorer.exe restarts (TaskbarCreated)
+ *   - Position persisted in HKCU\Software\SysGlance, clamped on-screen
+ *     after resolution changes and on launch (stale multi-monitor coords)
  *   - Auto-registers itself in the Run key on first launch
  *
  * How to build (cross, from Linux):
  *   x86_64-w64-mingw32-gcc -O2 -mwindows -o sysglance.exe src/sysglance.c \
- *       -lgdi32 -luser32 -ladvapi32 -lpdh -liphlpapi -lshell32
+ *       -lgdi32 -luser32 -ladvapi32 -lpdh -liphlpapi -lshell32 -ldxgi
  */
 
-#include <windows.h>
 #include <winsock2.h>
+#include <windows.h>
 #include <pdh.h>
 #include <pdhmsg.h>
 #include <netioapi.h>
@@ -48,13 +53,11 @@
 #define GRID_COLS       2
 #define GRID_ROWS       10
 #define TOP_N           10
-
-/* window metrics scale with DPI-ish font; fixed for simplicity */
-#define LINE_H          22
-#define PAD             8
-#define WND_W           340
 #define HDR_LINES       8
-#define WND_H           (PAD*2 + (HDR_LINES + TOP_N) * LINE_H)
+
+/* window metrics: computed once at startup from the system DPI
+ * (base values are for 96 dpi / 100%) */
+static int LINE_H, PAD, WND_W, WND_H;
 
 /* ---------------- state ---------------- */
 
@@ -62,6 +65,7 @@ typedef struct {
     double cpu, ram;
     DWORD  ram_used_mb, ram_total_mb;
     double gpu, vram_mb;
+    int    gpu_ok, vram_ok, disk_ok;   /* 0 = counter unavailable -> "n/a" */
     double disk_r_kbps, disk_w_kbps;
     double net_down_kbps, net_up_kbps;
     unsigned long long net_total_in, net_total_out;
@@ -83,6 +87,8 @@ static int      g_top_count;
 static BOOL  g_click_through = TRUE;
 static POINT g_wnd_pos      = { -1, -1 };
 static NOTIFYICONDATAW g_nid;
+static UINT   g_msg_taskbar;            /* "TaskbarCreated" broadcast */
+static HANDLE g_single_mutex;
 static HBRUSH g_br_back, g_br_hdr;
 static HFONT  g_font, g_font_proc;
 
@@ -94,11 +100,18 @@ static int g_cpu_first = 1;
 static unsigned long long g_net_in_prev, g_net_out_prev;
 static int g_net_first = 1;
 
-/* per-process CPU: pid -> last cycle time */
+/* per-process CPU: double-buffered pid -> last CPU time (user+kernel, 100 ns).
+ * One buffer holds the previous sample, the other is being filled; the
+ * indices swap each pass. Rebuilt every sample, so dead pids (and reused
+ * pids, via the delta clamp) age out naturally. */
 typedef struct { DWORD pid; unsigned long long t; } ProcTime;
-static ProcTime g_ptable[4096];
-static int g_ptable_n;
-static unsigned long long g_proc_interval_cycles = 0;
+static ProcTime g_ptable[2][4096];
+static int      g_ptable_n[2];
+static int      g_ptable_cur;                    /* index to fill this pass */
+static LARGE_INTEGER g_qpc_freq;                 /* set once at startup     */
+static unsigned long long g_wall_prev;           /* QPC, 100 ns units       */
+
+/* ---------------- persistence ---------------- */
 
 /* PDH */
 static PDH_HQUERY   g_q;
@@ -223,7 +236,8 @@ static double QueryCPU(void)
         unsigned long long d_idl = di - g_idle_prev;
         if (d_all > 0) {
             double load = 100.0 * (double)(d_all - d_idl) / (double)d_all;
-            if (load < 0) load = 0; if (load > 100) load = 100;
+            if (load < 0)   load = 0;
+            if (load > 100) load = 100;
             g_m.cpu = load;
         }
     }
@@ -285,9 +299,15 @@ static void QueryPDH(void)
     /* Fail-safe: PDH data collection keeps failing -> counters gone stale.
      * After 3 consecutive failures disable PDH entirely so the widget shows
      * an honest "n/a" instead of a frozen ghost value. */
-    if (!g_pdh_ok) return;
+    if (!g_pdh_ok) {
+        g_m.gpu_ok = g_m.vram_ok = g_m.disk_ok = 0;
+        return;
+    }
     if (PdhCollectQueryData(g_q) != ERROR_SUCCESS) {
-        if (++g_pdh_fail >= 3) g_pdh_ok = FALSE;
+        if (++g_pdh_fail >= 3) {
+            g_pdh_ok = FALSE;
+            g_m.gpu_ok = g_m.vram_ok = g_m.disk_ok = 0;
+        }
         return;
     }
     g_pdh_fail = 0;
@@ -313,6 +333,7 @@ static void QueryPDH(void)
                     if (arr[i].FmtValue.CStatus == ERROR_SUCCESS &&
                         arr[i].FmtValue.doubleValue > g_m.gpu)
                         g_m.gpu = arr[i].FmtValue.doubleValue;
+                g_m.gpu_ok = 1;
             }
             free(arr);
         }
@@ -331,6 +352,7 @@ static void QueryPDH(void)
                     if (arr[i].FmtValue.CStatus == ERROR_SUCCESS)
                         mb += arr[i].FmtValue.largeValue >> 20;
                 g_m.vram_mb = (double)mb;
+                g_m.vram_ok = 1;
             }
             free(arr);
         }
@@ -346,6 +368,7 @@ static void QueryPDH(void)
     if (g_c_disk_w && PdhGetFormattedCounterValue(g_c_disk_w, PDH_FMT_DOUBLE, NULL, &v)
         == ERROR_SUCCESS && v.CStatus == ERROR_SUCCESS)
         g_m.disk_w_kbps = v.doubleValue / 1024.0;
+    g_m.disk_ok = (g_c_disk_r || g_c_disk_w) && g_pdh_ok;
 }
 
 static void QueryNet(void)
@@ -371,101 +394,103 @@ static void QueryNet(void)
     g_net_in_prev = in; g_net_out_prev = out;
 }
 
-/* per-process CPU via Toolhelp snapshot + cycle time (Vista+) */
-static unsigned long long GetProcCycles(HANDLE h)
+/* Wall clock in 100 ns units from QPC (no 32-bit truncation, no overflow). */
+static unsigned long long WallClock100ns(void)
 {
-    unsigned long long cycles = 0;
-    if (!QueryProcessCycleTime(h, &cycles)) return 0;
-    return cycles;
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    return (unsigned long long)(c.QuadPart / g_qpc_freq.QuadPart) * 10000000ULL
+         + (unsigned long long)((c.QuadPart % g_qpc_freq.QuadPart) * 10000000ULL
+                                / g_qpc_freq.QuadPart);
 }
 
+/* Per-process CPU via Toolhelp snapshot + GetProcessTimes deltas:
+ *   cpu% = delta(user+kernel) / (delta_wall x logical cores) x 100
+ * — the same math Task Manager uses. PROCESS_QUERY_LIMITED_INFORMATION is
+ * enough for both GetProcessTimes and GetProcessMemoryInfo, so no elevation
+ * is needed; protected processes just report 0 (we cannot see their times).
+ * (v1.1 tried cycle-time deltas, but the previous sample was never stored
+ * and the normalization used a since-boot cumulative total, so the numbers
+ * were meaningless. This version keeps an explicit per-pid previous table.) */
 static void QueryTopProcs(void)
 {
-    /* interval length in cycles = total CPU cycles elapsed since last call */
-    unsigned long long total_now;
     HANDLE snap;
     PROCESSENTRY32W pe;
-    int i, j;
+    int i, n = 0;
+    unsigned long long wall = WallClock100ns();
+    unsigned long long dwall = wall - g_wall_prev;
+    g_wall_prev = wall;
 
-    /* measure wall interval in 100ns units via GetSystemTimes deltas already stored */
+    ProcTime *prev = g_ptable[g_ptable_cur ^ 1];
+    int       prev_n = g_ptable_n[g_ptable_cur ^ 1];
+    ProcTime *cur = g_ptable[g_ptable_cur];
+    int       cur_n = 0;
+
+    ProcInfo list[512];
+
     snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return;
-
-    static unsigned long long last_total_cycles = 0;
-    unsigned long long sys_cycles = 0;
-    FILETIME _f1, sys_krn, sys_usr;
-    GetSystemTimes(&_f1, &sys_krn, &sys_usr); /* cheap; reuse delta base */
-    (void)sys_cycles;
-
-    ProcInfo list[256];
-    int n = 0;
-
-    /* first pass: gather cycles+ram per process */
-    static unsigned long long prev_cycles[4096];
-    static DWORD prev_pids[4096];
-    static int prev_n = 0;
-
-    unsigned long long interval = g_usr_prev + g_krn_prev; /* rough base updated by QueryCPU */
-    (void)interval;
 
     pe.dwSize = sizeof pe;
     if (Process32FirstW(snap, &pe)) {
         do {
-            if (n >= 256) break;
-            HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
-            if (!h) continue;
-            unsigned long long cyc = GetProcCycles(h);
-            PROCESS_MEMORY_COUNTERS pmc;
-            size_t ram = 0;
-            if (GetProcessMemoryInfo(h, &pmc, sizeof pmc))
-                ram = pmc.WorkingSetSize >> 20;
-            CloseHandle(h);
-
-            /* find previous cycles for this pid */
+            unsigned long long t = 0, dt = 0;
             double cpu = 0;
+            size_t ram = 0;
+            HANDLE h;
+
+            if (n >= 512) break;
+            if (pe.th32ProcessID == 0) continue;   /* Idle: would top every list */
+
+            h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
+            if (h) {
+                FILETIME crea, exit, krn, usr;
+                PROCESS_MEMORY_COUNTERS pmc;
+                if (GetProcessTimes(h, &crea, &exit, &krn, &usr))
+                    t = FT2U(krn) + FT2U(usr);
+                if (GetProcessMemoryInfo(h, &pmc, sizeof pmc))
+                    ram = pmc.WorkingSetSize >> 20;
+                CloseHandle(h);
+            }
+
             for (i = 0; i < prev_n; i++)
-                if (prev_pids[i] == pe.th32ProcessID) {
-                    if (g_proc_interval_cycles > 0) {
-                        cpu = 100.0 * (double)(cyc - prev_cycles[i])
-                              / (double)g_proc_interval_cycles;
-                        if (cpu < 0) cpu = 0;
-                    }
+                if (prev[i].pid == pe.th32ProcessID) {
+                    dt = t - prev[i].t;   /* pid reuse -> negative, clamped below */
                     break;
                 }
-
-            if (n < 256) {
-                list[n].pid = pe.th32ProcessID;
-                wcsncpy(list[n].name, pe.szExeFile, 31);
-                list[n].name[31] = 0;
-                list[n].cpu = cpu;
-                list[n].ram_mb = ram;
-                n++;
+            if (dwall > 0 && dt > 0) {
+                cpu = 100.0 * (double)dt / ((double)dwall * (double)g_cpu_cores);
+                if (cpu > 100.0 * g_cpu_cores) cpu = 100.0 * g_cpu_cores;
             }
+
+            if (cur_n < 4096) {
+                cur[cur_n].pid = pe.th32ProcessID;
+                cur[cur_n].t = t;
+                cur_n++;
+            }
+
+            list[n].pid = pe.th32ProcessID;
+            wcsncpy(list[n].name, pe.szExeFile, 31);
+            list[n].name[31] = 0;
+            list[n].cpu = cpu;
+            list[n].ram_mb = ram;
+            n++;
         } while (Process32NextW(snap, &pe));
     }
     CloseHandle(snap);
 
-    /* second pass: store cycles for next call */
-    prev_n = 0;
-    for (i = 0; i < n && prev_n < 4096; i++) {
-        prev_pids[prev_n] = list[i].pid;
-        /* re-fetch cycles is expensive; instead reuse from this pass:
-           we saved only cpu, so approximate by storing nothing new.
-           For accuracy we re-open; acceptable at 500 ms cadence. */
-        prev_n++;
-    }
-    /* NOTE: to keep this cheap and correct, we re-query cycles in a
-       dedicated snapshot below (single pass design v2.1). */
+    g_ptable_n[g_ptable_cur] = cur_n;
+    g_ptable_cur ^= 1;   /* the buffer just filled becomes "previous" */
 
-    /* sort by cpu desc */
+    /* insertion sort by cpu desc (n <= 512) */
     for (i = 1; i < n; i++) {
         ProcInfo key = list[i];
+        int j;
         for (j = i - 1; j >= 0 && list[j].cpu < key.cpu; j--) list[j + 1] = list[j];
         list[j + 1] = key;
     }
     g_top_count = n < TOP_N ? n : TOP_N;
     for (i = 0; i < g_top_count; i++) g_top[i] = list[i];
-    (void)total_now; (void)last_total_cycles;
 }
 
 /* ---------------- rendering ---------------- */
@@ -511,23 +536,25 @@ static void DrawWindow(HDC dc, HWND hwnd)
              g_m.ram, g_m.ram_used_mb >> 10, g_m.ram_total_mb >> 10);
     TextOutW(dc, PAD, y, line, (int)wcslen(line)); y += LINE_H;
 
-    if (g_m.gpu >= 0)
+    if (g_m.gpu_ok)
         swprintf(line, 128, L"GPU  %3.0f%%", g_m.gpu);
     else
         swprintf(line, 128, L"GPU   n/a");
     TextOutW(dc, PAD, y, line, (int)wcslen(line)); y += LINE_H;
 
-
-    if (g_m.vram_mb >= 0 && g_vram_total_mb > 0)
+    if (g_m.vram_ok && g_vram_total_mb > 0)
         swprintf(line, 128, L"VRAM %.1f/%.0fG", g_m.vram_mb / 1024.0, g_vram_total_mb / 1024.0);
-    else if (g_m.vram_mb >= 0)
+    else if (g_m.vram_ok)
         swprintf(line, 128, L"VRAM %.1fG", g_m.vram_mb / 1024.0);
     else
         swprintf(line, 128, L"VRAM  n/a");
     TextOutW(dc, PAD, y, line, (int)wcslen(line)); y += LINE_H;
 
-    swprintf(line, 128, L"DSK  R %4.0f  W %4.0f K/s",
-             g_m.disk_r_kbps, g_m.disk_w_kbps);
+    if (g_m.disk_ok)
+        swprintf(line, 128, L"DSK  R %4.0f  W %4.0f K/s",
+                 g_m.disk_r_kbps, g_m.disk_w_kbps);
+    else
+        swprintf(line, 128, L"DSK   n/a");
     TextOutW(dc, PAD, y, line, (int)wcslen(line)); y += LINE_H;
 
     swprintf(line, 128, L"NET  v %4.0f  ^ %4.0f K/s",
@@ -537,13 +564,20 @@ static void DrawWindow(HDC dc, HWND hwnd)
     swprintf(line, 128, L"     in %-7ls  out %-7ls", bin, bout);
     TextOutW(dc, PAD, y, line, (int)wcslen(line)); y += LINE_H;
 
-    /* separator */
-    SetTextColor(dc, RGB(100, 140, 160));
+    /* separator strip */
+    {
+        RECT strip = { 0, y - PAD / 2, rc.right, y + LINE_H - PAD / 2 };
+        FillRect(dc, &strip, g_br_hdr);
+    }
+    SetTextColor(dc, RGB(120, 165, 190));
     TextOutW(dc, PAD, y, L"TOP PROCESSES", 13); y += LINE_H;
 
     SelectObject(dc, g_font_proc);
     for (int i = 0; i < g_top_count; i++) {
-        SetTextColor(dc, RGB(210, 220, 230));
+        /* highlight busy processes so they catch the eye */
+        if (g_top[i].cpu >= 70)      SetTextColor(dc, RGB(250, 120, 110));
+        else if (g_top[i].cpu >= 30) SetTextColor(dc, RGB(240, 170, 120));
+        else                         SetTextColor(dc, RGB(210, 220, 230));
         /* name (truncated) left, cpu% right-aligned — roomy layout */
         swprintf(line, 128, L"%-18.18ls %3.0f%% %5luM",
                  g_top[i].name, g_top[i].cpu, (unsigned long)g_top[i].ram_mb);
@@ -595,27 +629,38 @@ static void ShowMenu(HWND hwnd)
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
+    /* explorer.exe restarted: our tray icon is gone, re-add it */
+    if (msg == g_msg_taskbar && g_msg_taskbar) {
+        Shell_NotifyIconW(NIM_ADD, &g_nid);
+        return 0;
+    }
+
     switch (msg) {
     case WM_CREATE:
         SetTimer(hwnd, TIMER_ID, INTERVAL_MS, NULL);
         return 0;
-    case WM_TIMER: {
-        unsigned long long cyc_base;
+    case WM_TIMER:
         QueryCPU();
-        cyc_base = g_usr_prev + g_krn_prev;
-        if (g_proc_interval_cycles == 0) g_proc_interval_cycles = 1;
-        g_proc_interval_cycles = cyc_base; /* total cycles seen so far */
         QueryRAM();
         QueryPDH();
         QueryNet();
         QueryTopProcs();
         InvalidateRect(hwnd, NULL, FALSE);
         return 0;
-    }
     case WM_PAINT: {
+        /* double buffered: compose off-screen, one BitBlt, no flicker */
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(hwnd, &ps);
-        DrawWindow(dc, hwnd);
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        HDC mem = CreateCompatibleDC(dc);
+        HBITMAP bm = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
+        HBITMAP old = SelectObject(mem, bm);
+        DrawWindow(mem, hwnd);
+        BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
+        SelectObject(mem, old);
+        DeleteObject(bm);
+        DeleteDC(mem);
         EndPaint(hwnd, &ps);
         return 0;
     }
@@ -644,6 +689,21 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_TRAYICON:
         if (LOWORD(lp) == WM_RBUTTONUP || LOWORD(lp) == WM_CONTEXTMENU) ShowMenu(hwnd);
         return 0;
+    case WM_DISPLAYCHANGE: {
+        /* resolution / monitor change: pull a saved-off-screen position back */
+        int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
+        int x = g_wnd_pos.x, y = g_wnd_pos.y;
+        if (x > sw - WND_W - 16) x = sw - WND_W - 16;
+        if (x < 0) x = 0;
+        if (y > sh - WND_H - 16) y = sh - WND_H - 16;
+        if (y < 0) y = 0;
+        if (x != g_wnd_pos.x || y != g_wnd_pos.y) {
+            g_wnd_pos.x = x; g_wnd_pos.y = y;
+            SetWindowPos(hwnd, 0, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+            SaveSettings();
+        }
+        return 0;
+    }
     case WM_DESTROY:
         KillTimer(hwnd, TIMER_ID);
         SaveSettings();
@@ -661,9 +721,43 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     HWND hwnd;
 
     (void)prev; (void)cmd; (void)show;
+
+    /* single instance: autostart + a manual launch must not stack widgets */
+    g_single_mutex = CreateMutexW(NULL, TRUE, L"Local\\SysGlance");
+    if (g_single_mutex && GetLastError() == ERROR_ALREADY_EXISTS) return 0;
+
+    /* crisp text on high-DPI screens (metrics below read the real DPI) */
+    SetProcessDPIAware();
+
+    /* scale window metrics + fonts from the system DPI (96 = 100%) */
+    {
+        HDC sdc = GetDC(NULL);
+        double k = GetDeviceCaps(sdc, LOGPIXELSX) / 96.0;
+        ReleaseDC(NULL, sdc);
+        LINE_H = (int)(22.0 * k + 0.5);
+        PAD    = (int)(8.0  * k + 0.5);
+        WND_W  = (int)(340.0 * k + 0.5);
+        WND_H  = PAD * 2 + (HDR_LINES + TOP_N) * LINE_H;
+    }
+
+    QueryPerformanceFrequency(&g_qpc_freq);   /* for per-process CPU deltas */
+
     LoadSettings();
+
+    /* a position saved on a monitor that is no longer attached would put
+     * the widget off-screen forever — clamp into the current screen */
+    {
+        int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
+        if (g_wnd_pos.x > sw - WND_W)     g_wnd_pos.x = sw - WND_W - 16;
+        if (g_wnd_pos.x < 0)              g_wnd_pos.x = 0;
+        if (g_wnd_pos.y > sh - WND_H)     g_wnd_pos.y = sh - WND_H - 16;
+        if (g_wnd_pos.y < 0)              g_wnd_pos.y = 0;
+    }
+
     InitPDH();
     InitHardwareInfo();
+
+    g_msg_taskbar = RegisterWindowMessageW(L"TaskbarCreated");
 
     ZeroMemory(&wc, sizeof wc);
     wc.lpfnWndProc = WndProc;
@@ -696,10 +790,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 
     g_br_back = CreateSolidBrush(RGB(20, 26, 34));
     g_br_hdr  = CreateSolidBrush(RGB(28, 36, 46));
-    g_font = CreateFontW(-17, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+    g_font = CreateFontW(-(LINE_H - 5), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
                          OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                          CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_MODERN, L"Consolas");
-    g_font_proc = CreateFontW(-16, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET,
+    g_font_proc = CreateFontW(-(LINE_H - 6), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET,
                          OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                          CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_MODERN, L"Consolas");
 
@@ -710,7 +804,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_nid.uCallbackMessage = WM_TRAYICON;
     g_nid.hIcon = LoadIconW(NULL, (LPCWSTR)IDI_APPLICATION);
-    wcscpy(g_nid.szTip, L"SysGlance — system monitor (right-click)");
+    wcscpy(g_nid.szTip, L"SysGlance 1.2 — system monitor (right-click)");
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
@@ -722,5 +816,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     DeleteObject(g_br_hdr);
     DeleteObject(g_font);
     DeleteObject(g_font_proc);
+    if (g_single_mutex) CloseHandle(g_single_mutex);
     return (int)msg.wParam;
 }

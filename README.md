@@ -33,8 +33,11 @@ No installer. No runtime. No telemetry. One 270 KB executable.
 - **Click-through by default** — the widget never steals focus or blocks clicks; right-click the **tray icon** for options
 - **"On desktop" layer** — sits above the wallpaper but *below every window* (the same reparenting into `SHELLDLL_DefView` / `Progman` that Rainmeter uses), so it never covers your applications
 - **Auto-starts with Windows** (registry Run key; toggle from the tray menu)
-- **Position persistence** — remembers where you dragged it (`HKCU\Software\SysGlance`)
+- **Position persistence** — remembers where you dragged it (`HKCU\Software\SysGlance`); clamps itself back on-screen after resolution changes or when the saved monitor is gone
 - **Resolution-independent anchoring** — docks to the top-right cell of a 2x10 grid over the primary screen, so it lands correctly on 1080p, 1440p, 4K and ultrawide alike
+- **DPI-aware** — fonts and widget size scale with the system DPI (crisp, not blurry, on 125%/150%)
+- **Single instance** — the autostart entry plus a manual launch never stack two widgets (named mutex)
+- **Survives explorer restarts** — re-adds its tray icon when explorer.exe comes back (`TaskbarCreated`)
 
 ## Build
 
@@ -44,10 +47,10 @@ Cross-compile from Linux (single command):
 x86_64-w64-mingw32-gcc -O2 -municode -mwindows \
     -D_WIN32_WINNT=0x0601 -DNTDDI_VERSION=0x06010000 \
     -o sysglance.exe src/sysglance.c \
-    -lgdi32 -luser32 -ladvapi32 -lpdh -liphlpapi -lshell32 -lws2_32 -lpsapi
+    -lgdi32 -luser32 -ladvapi32 -lpdh -liphlpapi -lshell32 -lws2_32 -lpsapi -ldxgi
 ```
 
-Or on Windows with [mingw-w64](https://winlibs.com/) / MSYS2 using the same command (drop the `x86_64-w64-mingw32-` prefix). MSVC works too — the code is plain C with standard Windows headers.
+Or on Windows with [mingw-w64](https://winlibs.com/) / MSYS2 using the same command (drop the `x86_64-w64-mingw32-` prefix). MSVC works too — the code is plain C with standard Windows headers. `./build.sh` wraps both and also builds the `gpuprobe` diagnostic.
 
 ## Usage
 
@@ -61,14 +64,21 @@ Or on Windows with [mingw-w64](https://winlibs.com/) / MSYS2 using the same comm
 
 ## Design notes
 
-- **Single source file** (`src/sysglance.c`, ~700 LOC) — everything visible in one read.
-- **Zero dependencies**: only `user32`, `gdi32`, `pdh`, `iphlpapi`, `psapi`, `shell32`, `advapi32`, `ws2_32` — all system libraries present on every Windows 10/11 install.
-- **Graceful degradation**: if a performance counter is missing (e.g. GPU counters on a VM), the row shows `n/a` instead of crashing.
-- **Sampling**: system metrics refresh every 500 ms; process CPU% is computed from cycle-time deltas between samples.
+- **Single source file** (`src/sysglance.c`, ~800 LOC) — everything visible in one read.
+- **Zero dependencies**: only `user32`, `gdi32`, `pdh`, `iphlpapi`, `psapi`, `shell32`, `advapi32`, `ws2_32`, `dxgi` — all system libraries present on every Windows 10/11 install.
+- **Graceful degradation**: if a performance counter is missing (e.g. GPU counters on a VM) or dies at runtime, the row shows `n/a` instead of a frozen ghost value.
+- **Sampling**: system metrics refresh every 500 ms; process CPU% is computed from `GetProcessTimes` deltas between samples.
+- **Double-buffered painting** — the widget composes off-screen and blits once, so the 500 ms refresh never flickers.
 
-### Why cycle-time deltas for per-process CPU?
+### Per-process CPU: GetProcessTimes deltas (v1.2)
 
-`QueryProcessCycleTime` gives the CPU cycles consumed by a process. Comparing consecutive samples and normalizing by the total system cycle delta yields a stable per-process CPU% without requiring elevated privileges or undocumented APIs.
+```
+cpu% = Δ(user+kernel time) / (Δwallclock × logical cores) × 100
+```
+
+— the same math Task Manager uses. `PROCESS_QUERY_LIMITED_INFORMATION` is enough for `GetProcessTimes`, so no elevation is needed; protected processes (Secure System, Registry under VBS) honestly report 0 because the OS won't show us their times.
+
+v1.1 attempted this with `QueryProcessCycleTime` deltas, but the implementation had two fatal flaws: the previous sample's cycle count was never actually stored (the delta base stayed zero), and the normalization divided by a *since-boot cumulative* total, so the numbers were meaningless. v1.2 keeps an explicit double-buffered pid→time table and normalizes by wall clock. Verified with a 1-core busy loop: 12 logical cores → the loop process reads ~8%, exactly 100/12.
 
 ### GPU utilization: what the fix taught us (v1.1)
 
@@ -86,7 +96,14 @@ The diagnosis was done with `src/gpuprobe.c` — a standalone 100 ms console too
 |---|---|
 | OS | Windows 10/11 x64 (PDH GPU counters require 1709+) |
 | GPU (verified) | **NVIDIA GeForce RTX 2070 SUPER** (driver-reported engine counters incl. Compute) |
-| Load used for verification | Ollama `bge-m3` embedding batches — GPU 80–100%, VRAM ~0.75→1.6 GB, decays back after unload |
+| Load used for verification | v1.1: Ollama `bge-m3` embedding batches — GPU 80–100%, VRAM ~0.75→1.6 GB · v1.2: 1-core busy loop — process reads ~8% on 12 logical cores (100/12, exactly as Task Manager math predicts) |
+| Screen | 3440×1440 ultrawide, 100% scaling (widget also DPI-aware) |
+
+## Changelog
+
+- **v1.2** — per-process CPU% actually works now (`GetProcessTimes` deltas; the v1.1 cycle-time code never stored the previous sample, so the numbers were meaningless); real `n/a` fallbacks for GPU/VRAM/DSK when counters die at runtime; DPI-aware scaling; single instance; tray icon re-added after explorer restart; position clamped on-screen after display changes; double-buffered (flicker-free) painting; busy processes highlighted (≥30% / ≥70%); links `dxgi` explicitly for the VRAM total.
+- **v1.1** — GPU utilization fixes (ratchet reset, all engine types, wildcard array read).
+- **v1.0** — initial release.
 
 The PDH `GPU Engine` counter interface itself is vendor-neutral (NVIDIA, AMD and Intel all expose it on Win10 1709+), so no code path is NVIDIA-specific — but **live verification has only been performed on the NVIDIA GPU above**. Reports from AMD/Intel iGPU systems are welcome via issues.
 

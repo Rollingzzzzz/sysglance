@@ -1,5 +1,5 @@
 /*
- * sysglance v1.4 — a tiny always-on-top system monitor widget for Windows 10/11
+ * sysglance v1.5 — a tiny always-on-top system monitor widget for Windows 10/11
  *
  * Pure Win32 + GDI. Single file. No runtime dependencies. MIT license.
  * Builds with mingw-w64 (x64): see build.sh / README.
@@ -701,6 +701,79 @@ static int              g_conn_n;
 static DWORD            g_tick;                 /* UI tick counter          */
 static CRITICAL_SECTION g_conn_cs;
 
+/* live TCP endpoints (system table, no bytes): fills the remaining
+ * TOP CONNECTIONS rows so the section scales like TOP PROCESSES even
+ * when ETW has not seen traffic for those peers yet */
+typedef struct {
+    unsigned char addr[16];
+    int  is_v6;
+    unsigned short port;
+    DWORD pid;
+} TcpPeer;
+static TcpPeer g_tcp[64];
+static int     g_tcp_n;
+
+static void RefreshTcpPeers(void)
+{
+    static const ULONG afs[2] = { AF_INET, AF_INET6 };
+    int n = 0, a, i, j;
+
+    for (a = 0; a < 2 && n < 64; a++) {
+        ULONG sz = 0;
+        void *tbl = NULL;
+        if (GetExtendedTcpTable(NULL, &sz, FALSE, afs[a],
+                                TCP_TABLE_OWNER_MODULE_ALL, 0) != ERROR_INSUFFICIENT_BUFFER)
+            continue;
+        tbl = malloc(sz);
+        if (!tbl) continue;
+        if (GetExtendedTcpTable(tbl, &sz, FALSE, afs[a],
+                                TCP_TABLE_OWNER_MODULE_ALL, 0) == ERROR_SUCCESS) {
+            if (afs[a] == AF_INET) {
+                MIB_TCPTABLE_OWNER_MODULE *t = tbl;
+                for (i = 0; i < (int)t->dwNumEntries && n < 64; i++) {
+                    MIB_TCPROW_OWNER_MODULE *r = &t->table[i];
+                    DWORD ip = r->dwRemoteAddr;
+                    unsigned short port =
+                        (unsigned short)(((r->dwRemotePort & 0xff) << 8)
+                                         | ((r->dwRemotePort >> 8) & 0xff));
+                    if (r->dwState != MIB_TCP_STATE_ESTAB) continue;
+                    if (ip == 0) continue;
+                    for (j = 0; j < n; j++)                 /* dedupe addr:port */
+                        if (!g_tcp[j].is_v6 && !memcmp(g_tcp[j].addr, &ip, 4)
+                            && g_tcp[j].port == port) break;
+                    if (j < n) continue;
+                    memcpy(g_tcp[n].addr, &ip, 4);
+                    g_tcp[n].is_v6 = 0;
+                    g_tcp[n].port = port;
+                    g_tcp[n].pid = (DWORD)r->dwOwningPid;
+                    n++;
+                }
+            } else {
+                MIB_TCP6TABLE_OWNER_MODULE *t = tbl;
+                for (i = 0; i < (int)t->dwNumEntries && n < 64; i++) {
+                    MIB_TCP6ROW_OWNER_MODULE *r = &t->table[i];
+                    unsigned short port =
+                        (unsigned short)(((r->dwRemotePort & 0xff) << 8)
+                                         | ((r->dwRemotePort >> 8) & 0xff));
+                    if (r->dwState != MIB_TCP_STATE_ESTAB) continue;
+                    if (!r->ucRemoteAddr[0] && !r->ucRemoteAddr[15]) continue;
+                    for (j = 0; j < n; j++)
+                        if (g_tcp[j].is_v6 && !memcmp(g_tcp[j].addr, r->ucRemoteAddr, 16)
+                            && g_tcp[j].port == port) break;
+                    if (j < n) continue;
+                    memcpy(g_tcp[n].addr, r->ucRemoteAddr, 16);
+                    g_tcp[n].is_v6 = 1;
+                    g_tcp[n].port = port;
+                    g_tcp[n].pid = (DWORD)r->dwOwningPid;
+                    n++;
+                }
+            }
+        }
+        free(tbl);
+    }
+    g_tcp_n = n;
+}
+
 static TRACEHANDLE g_trace_session;             /* StartTrace handle        */
 static TRACEHANDLE g_trace_consumer;            /* OpenTrace handle         */
 static volatile LONG g_etw_state;               /* 0 off, 1 on, 2 denied    */
@@ -842,6 +915,7 @@ static void ConnTick(void)
     int i;
     double secs = INTERVAL_MS / 1000.0;
     g_tick++;
+    RefreshTcpPeers();
     if (g_etw_state != 1) return;
     EnterCriticalSection(&g_conn_cs);
     for (i = 0; i < g_conn_n; i++) {
@@ -856,11 +930,27 @@ static void ConnTick(void)
     LeaveCriticalSection(&g_conn_cs);
 }
 
-/* draw the TOP CONNECTIONS rows (called from DrawWindow) */
-static void ConnDraw(HDC dc, int y, int rows)
+/* pad string s to exactly `width` chars (truncating longer, spacing
+ * shorter) — used instead of printf '*' widths, which this CRT
+ * mishandles when further %ls string args follow (verified: crash) */
+static void PadTo(wchar_t *dst, int cap, const wchar_t *s, int width)
 {
-    wchar_t line[160], a[48], bi[10], bo[10];
+    int i = 0;
+    for (; i < width && s[i] && i < cap - 1; i++) dst[i] = s[i];
+    for (; i < width && i < cap - 1; i++) dst[i] = L' ';
+    dst[i] = 0;
+}
+
+/* draw the TOP CONNECTIONS rows (called from DrawWindow) */
+static void ConnDraw(HDC dc, int y, int rows, int width)
+{
+    wchar_t line[160], a[48], bi[10], bo[10], padd[72];
     int order[TOP_MAX], n = 0, i, j;
+    /* address column stretches with the window so the v/^ byte columns
+     * stay flush against the right edge, like the process rows */
+    int addrw = (width - 2 * PAD) / g_char_w - 31;
+    if (addrw < 23) addrw = 23;
+    if (addrw > 70) addrw = 70;
 
     if (g_etw_state == 2) {
         SetTextColor(dc, RGB(150, 150, 150));
@@ -874,43 +964,72 @@ static void ConnDraw(HDC dc, int y, int rows)
     }
 
     /* top rows by live rate, ties/broken by cumulative volume */
-    EnterCriticalSection(&g_conn_cs);
     {
-        int used[512] = {0};
-        for (i = 0; i < rows; i++) {
-            int best = -1;
-            for (j = 0; j < g_conn_n; j++) {
-                if (used[j]) continue;
-                if (best < 0) { best = j; continue; }
-                double a_ = g_conn[j].rin + g_conn[j].rout;
-                double b_ = g_conn[best].rin + g_conn[best].rout;
-                if (a_ > b_ ||
-                    (a_ == b_ && g_conn[j].bin + g_conn[j].bout >
-                                 g_conn[best].bin + g_conn[best].bout))
-                    best = j;
+        unsigned char shown[TOP_MAX][16];
+        int shown_v6[TOP_MAX];
+        EnterCriticalSection(&g_conn_cs);
+        {
+            int used[512] = {0};
+            for (i = 0; i < rows; i++) {
+                int best = -1;
+                for (j = 0; j < g_conn_n; j++) {
+                    if (used[j]) continue;
+                    if (best < 0) { best = j; continue; }
+                    double a_ = g_conn[j].rin + g_conn[j].rout;
+                    double b_ = g_conn[best].rin + g_conn[best].rout;
+                    if (a_ > b_ ||
+                        (a_ == b_ && g_conn[j].bin + g_conn[j].bout >
+                                     g_conn[best].bin + g_conn[best].bout))
+                        best = j;
+                }
+                if (best < 0 || g_conn[best].bin + g_conn[best].bout == 0) break;
+                used[best] = 1;
+                order[n++] = best;
             }
-            if (best < 0 || g_conn[best].bin + g_conn[best].bout == 0) break;
-            used[best] = 1;
-            order[n++] = best;
+            for (i = 0; i < n; i++) {
+                ConnAgg *c = &g_conn[order[i]];
+                int live = (g_tick - c->last_tick) < 6;   /* seen in last ~3 s */
+                fmt_addr(c->addr, c->is_v6, c->port, a, 48);
+                fmt_bytes(c->bin, bi, 10);
+                fmt_bytes(c->bout, bo, 10);
+                SetTextColor(dc, live ? RGB(140, 225, 245) : RGB(140, 160, 175));
+                PadTo(padd, 72, a, addrw);
+                swprintf(line, 160, L"%-12.12ls %ls v%7ls ^%7ls",
+                         PidNameLookup(c->pid), padd, bi, bo);
+                TextOutW(dc, PAD, y, line, (int)wcslen(line));
+                y += LINE_H;
+                memcpy(shown[i], c->addr, c->is_v6 ? 16 : 4);
+                shown_v6[i] = c->is_v6;
+            }
         }
-        for (i = 0; i < n; i++) {
-            ConnAgg *c = &g_conn[order[i]];
-            int live = (g_tick - c->last_tick) < 6;   /* seen in last ~3 s */
-            fmt_addr(c->addr, c->is_v6, c->port, a, 48);
-            fmt_bytes(c->bin, bi, 10);
-            fmt_bytes(c->bout, bo, 10);
-            SetTextColor(dc, live ? RGB(140, 225, 245) : RGB(140, 160, 175));
-            swprintf(line, 160, L"%-12.12ls %-23.23ls v%7ls ^%7ls",
-                     PidNameLookup(c->pid), a, bi, bo);
+        LeaveCriticalSection(&g_conn_cs);
+
+        /* fill the remaining rows with live TCP peers that ETW has not
+         * counted yet, so the section scales like TOP PROCESSES */
+        for (i = 0; i < g_tcp_n && n < rows; i++) {
+            int dup = 0;
+            for (j = 0; j < n; j++)
+                if (shown_v6[j] == g_tcp[i].is_v6 &&
+                    !memcmp(shown[j], g_tcp[i].addr, g_tcp[i].is_v6 ? 16 : 4)) {
+                    dup = 1;               /* traffic row already shows this IP */
+                    break;
+                }
+            if (dup) continue;
+            fmt_addr(g_tcp[i].addr, g_tcp[i].is_v6, g_tcp[i].port, a, 48);
+            SetTextColor(dc, RGB(110, 125, 140));
+            PadTo(padd, 72, a, addrw);
+            swprintf(line, 160, L"%-12.12ls %ls v%7ls ^%7ls",
+                     PidNameLookup(g_tcp[i].pid), padd, L"-", L"-");
             TextOutW(dc, PAD, y, line, (int)wcslen(line));
             y += LINE_H;
+            n++;
         }
+
         if (n == 0) {
             SetTextColor(dc, RGB(150, 150, 150));
             TextOutW(dc, PAD, y, L"(listening...)", 14);
         }
     }
-    LeaveCriticalSection(&g_conn_cs);
 }
 
 /* ---------------- rendering ---------------- */
@@ -1147,7 +1266,7 @@ static void DrawWindow(HDC dc, HWND hwnd)
     SetTextColor(dc, C_SEP);
     TextOutW(dc, PAD, y, L"TOP CONNECTIONS", 15); y += LINE_H;
 
-    ConnDraw(dc, y, rows);
+    ConnDraw(dc, y, rows, rc.right);
 }
 
 /* ---------------- window ---------------- */
@@ -1208,20 +1327,29 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         SetTimer(hwnd, TIMER_ID, INTERVAL_MS, NULL);
         return 0;
     case WM_NCHITTEST: {
-        /* resize grips on the right/bottom edges — only reachable when
+        /* resize grips on every edge and corner — only reachable when
          * click-through is off (transparent windows never see the mouse) */
         POINT pt;
         RECT rc;
         int edge = 8;
+        BOOL left, right, top, bottom;
         if (g_click_through) break;
         pt.x = (short)LOWORD(lp);
         pt.y = (short)HIWORD(lp);
         ScreenToClient(hwnd, &pt);
         GetClientRect(hwnd, &rc);
-        if (pt.x >= rc.right - edge && pt.y >= rc.bottom - edge)
-            return HTBOTTOMRIGHT;
-        if (pt.x >= rc.right - edge) return HTRIGHT;
-        if (pt.y >= rc.bottom - edge) return HTBOTTOM;
+        left   = pt.x <= edge;
+        right  = pt.x >= rc.right  - edge;
+        top    = pt.y <= edge;
+        bottom = pt.y >= rc.bottom - edge;
+        if (left   && top)    return HTTOPLEFT;
+        if (right  && top)    return HTTOPRIGHT;
+        if (left   && bottom) return HTBOTTOMLEFT;
+        if (right  && bottom) return HTBOTTOMRIGHT;
+        if (left)   return HTLEFT;
+        if (right)  return HTRIGHT;
+        if (top)    return HTTOP;
+        if (bottom) return HTBOTTOM;
         break;
     }
     case WM_SIZING: {
@@ -1246,9 +1374,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         g_wnd_cy = HIWORD(lp);
         InvalidateRect(hwnd, NULL, FALSE);
         return 0;
-    case WM_EXITSIZEMOVE:
-        SaveSettings();      /* position already saved by the drag handler */
+    case WM_EXITSIZEMOVE: {
+        /* edge-resizing from the top/left moves the origin too — read the
+         * real rect, the client-drag path only updates its own case */
+        RECT rc;
+        GetWindowRect(hwnd, &rc);
+        g_wnd_pos.x = rc.left;
+        g_wnd_pos.y = rc.top;
+        SaveSettings();
         return 0;
+    }
     case WM_TIMER:
         QueryCPU();
         QueryRAM();
@@ -1465,7 +1600,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_nid.uCallbackMessage = WM_TRAYICON;
     g_nid.hIcon = LoadIconW(NULL, (LPCWSTR)IDI_APPLICATION);
-    wcscpy(g_nid.szTip, L"SysGlance 1.4 — system monitor (right-click)");
+    wcscpy(g_nid.szTip, L"SysGlance 1.5 — system monitor (right-click)");
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {

@@ -1,5 +1,5 @@
 /*
- * sysglance v1.2 — a tiny always-on-top system monitor widget for Windows 10/11
+ * sysglance v1.4 — a tiny always-on-top system monitor widget for Windows 10/11
  *
  * Pure Win32 + GDI. Single file. No runtime dependencies. MIT license.
  * Builds with mingw-w64 (x64): see build.sh / README.
@@ -54,8 +54,8 @@
 #define INTERVAL_MS     500
 #define GRID_COLS       2
 #define GRID_ROWS       10
-#define TOP_N           15
-#define CONN_N          15         /* TOP CONNECTIONS rows               */
+#define TOP_MAX         30          /* list capacity (both sections)      */
+#define ROWS_MIN        5           /* enforced minimum rows per section  */
 
 /* sparkline history: 120 samples x 500 ms = 1 minute */
 #define HIST_N          120
@@ -65,7 +65,11 @@ enum { H_CPU, H_RAM, H_GPU, H_VRAM, H_DISK_R, H_DISK_W, H_NET_D, H_NET_U, H_COUN
 
 /* window metrics: computed once at startup from the system DPI
  * (base values are for 96 dpi / 100%) */
-static int LINE_H, PAD, WND_W, WND_H, GRAPH_H, GAP;
+static int LINE_H, PAD, GRAPH_H, GAP;
+static int g_def_cx, g_def_cy;      /* default window size (DPI-scaled)   */
+static int g_min_cx, g_min_cy;      /* resize floors                      */
+static int g_wnd_cx, g_wnd_cy;      /* current size (restored/saved)      */
+static int g_char_w = 9;            /* monospace char width (font_proc)   */
 
 /* per-metric colors: label text == sparkline color */
 static COLORREF C_CPU_L,  C_CPU_F;    /* line, fill */
@@ -99,7 +103,7 @@ typedef struct {
 static Metrics  g_m;
 static DWORD g_cpu_cores = 1;            /* logical processors */
 static double g_vram_total_mb = 0;      /* from DXGI, 0 = unknown */
-static ProcInfo g_top[TOP_N];
+static ProcInfo g_top[TOP_MAX];
 static int      g_top_count;
 
 /* pid -> exe name cache, refreshed by QueryTopProcs every tick;
@@ -192,6 +196,12 @@ static void LoadSettings(void)
         sz = sizeof v;
         if (RegQueryValueExW(k, L"Y", NULL, NULL, (LPBYTE)&v, &sz) == ERROR_SUCCESS
             && v < 0x7FFFFFFF) g_wnd_pos.y = (LONG)v;
+        sz = sizeof v;
+        if (RegQueryValueExW(k, L"W", NULL, NULL, (LPBYTE)&v, &sz) == ERROR_SUCCESS
+            && v >= (DWORD)g_min_cx && v < 0x7FFFFFFF) g_wnd_cx = (LONG)v;
+        sz = sizeof v;
+        if (RegQueryValueExW(k, L"H", NULL, NULL, (LPBYTE)&v, &sz) == ERROR_SUCCESS
+            && v >= (DWORD)g_min_cy && v < 0x7FFFFFFF) g_wnd_cy = (LONG)v;
         RegCloseKey(k);
     }
     if (g_wnd_pos.x < 0 || g_wnd_pos.y < 0) {
@@ -202,11 +212,11 @@ static void LoadSettings(void)
         int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
         int cell_h = sh / GRID_ROWS;
         int max_h = cell_h;               /* keep inside the top cell */
-        g_wnd_pos.x = sw - WND_W - 16;    /* flush right, 16 px margin */
-        g_wnd_pos.y = (max_h - WND_H) / 2;
+        g_wnd_pos.x = sw - g_wnd_cx - 16; /* flush right, 16 px margin */
+        g_wnd_pos.y = (max_h - g_wnd_cy) / 2;
         if (g_wnd_pos.y < 0) g_wnd_pos.y = 8;
-        if (g_wnd_pos.y > cell_h - WND_H && cell_h > WND_H)
-            g_wnd_pos.y = cell_h - WND_H;
+        if (g_wnd_pos.y > cell_h - g_wnd_cy && cell_h > g_wnd_cy)
+            g_wnd_pos.y = cell_h - g_wnd_cy;
     }
 }
 
@@ -216,8 +226,11 @@ static void SaveSettings(void)
     if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\SysGlance", 0, NULL, 0,
                         KEY_WRITE, NULL, &k, NULL) == ERROR_SUCCESS) {
         DWORD x = (DWORD)g_wnd_pos.x, y = (DWORD)g_wnd_pos.y;
+        DWORD w = (DWORD)g_wnd_cx, h = (DWORD)g_wnd_cy;
         RegSetValueExW(k, L"X", 0, REG_DWORD, (LPBYTE)&x, sizeof x);
         RegSetValueExW(k, L"Y", 0, REG_DWORD, (LPBYTE)&y, sizeof y);
+        RegSetValueExW(k, L"W", 0, REG_DWORD, (LPBYTE)&w, sizeof w);
+        RegSetValueExW(k, L"H", 0, REG_DWORD, (LPBYTE)&h, sizeof h);
         RegCloseKey(k);
     }
 }
@@ -605,7 +618,7 @@ static void QueryTopProcs(void)
         for (j = i - 1; j >= 0 && list[j].cpu < key.cpu; j--) list[j + 1] = list[j];
         list[j + 1] = key;
     }
-    g_top_count = n < TOP_N ? n : TOP_N;
+    g_top_count = n < TOP_MAX ? n : TOP_MAX;
     for (i = 0; i < g_top_count; i++) g_top[i] = list[i];
 }
 
@@ -844,10 +857,10 @@ static void ConnTick(void)
 }
 
 /* draw the TOP CONNECTIONS rows (called from DrawWindow) */
-static void ConnDraw(HDC dc, int y)
+static void ConnDraw(HDC dc, int y, int rows)
 {
     wchar_t line[160], a[48], bi[10], bo[10];
-    int order[CONN_N], n = 0, i, j;
+    int order[TOP_MAX], n = 0, i, j;
 
     if (g_etw_state == 2) {
         SetTextColor(dc, RGB(150, 150, 150));
@@ -860,11 +873,11 @@ static void ConnDraw(HDC dc, int y)
         return;
     }
 
-    /* top CONN_N by live rate, ties/broken by cumulative volume */
+    /* top rows by live rate, ties/broken by cumulative volume */
     EnterCriticalSection(&g_conn_cs);
     {
         int used[512] = {0};
-        for (i = 0; i < CONN_N; i++) {
+        for (i = 0; i < rows; i++) {
             int best = -1;
             for (j = 0; j < g_conn_n; j++) {
                 if (used[j]) continue;
@@ -961,9 +974,29 @@ static void DrawSeries(HDC dc, const RECT *rc, int s, double maxval,
     DeleteObject(pen);
 }
 
+/* dynamic layout: given the client size, how tall are the graphs and how
+ * many rows does each list section show? Extra height first buys more
+ * rows (up to TOP_MAX per section), then thickens the graphs. */
+static void ComputeLayout(int cx, int cy, int *graph_h, int *rows_each)
+{
+    int head, avail, rows;
+    (void)cx;
+    *graph_h = GRAPH_H;
+    head = PAD + 6 * (LINE_H + *graph_h + GAP) + LINE_H + GAP;
+    avail = cy - head - PAD - 2 * LINE_H - GAP;
+    rows = (avail / LINE_H) / 2;                 /* split across sections */
+    if (rows >= TOP_MAX) {
+        *rows_each = TOP_MAX;
+        *graph_h += (avail - TOP_MAX * 2 * LINE_H) / 6;
+        if (*graph_h > GRAPH_H * 4) *graph_h = GRAPH_H * 4;
+    } else {
+        *rows_each = rows < ROWS_MIN ? ROWS_MIN : rows;
+    }
+}
+
 /* "value line + sparkline below it" for one metric; returns y after gap */
 static int DrawMetric(HDC dc, const RECT *winrc, int y, int series,
-                      const wchar_t *text, double maxval,
+                      const wchar_t *text, double maxval, int gh,
                       COLORREF line_c, COLORREF fill_c)
 {
     RECT gr;
@@ -971,17 +1004,25 @@ static int DrawMetric(HDC dc, const RECT *winrc, int y, int series,
     TextOutW(dc, PAD, y, text, (int)wcslen(text));
     y += LINE_H;
     gr.left = PAD + 2;  gr.top = y + 3;
-    gr.right = winrc->right - PAD - 2;  gr.bottom = y + GRAPH_H - 2;
+    gr.right = winrc->right - PAD - 2;  gr.bottom = y + gh - 2;
     DrawSeries(dc, &gr, series, maxval, line_c, fill_c);
-    return y + GRAPH_H + GAP;
+    return y + gh + GAP;
 }
 
 static void DrawWindow(HDC dc, HWND hwnd)
 {
     RECT rc;
-    wchar_t line[160], bin[24], bout[24];
-    int y = PAD;
+    wchar_t line[200], bin[24], bout[24];
+    int y = PAD, gh, rows;
+    int procs_drawn, pathw;
+
     GetClientRect(hwnd, &rc);
+    ComputeLayout(rc.right, rc.bottom, &gh, &rows);
+    procs_drawn = g_top_count < rows ? g_top_count : rows;
+    /* path column uses whatever width is left after cpu%/RAM columns */
+    pathw = (rc.right - 2 * PAD) / g_char_w - 11;
+    if (pathw < 24) pathw = 24;
+    if (pathw > 70) pathw = 70;
 
     FillRect(dc, &rc, g_br_back);
     SetBkMode(dc, TRANSPARENT);
@@ -994,40 +1035,34 @@ static void DrawWindow(HDC dc, HWND hwnd)
     if (g_cpu_now_ghz > 0) {
         long total_mhz = (long)(g_cpu_max_ghz * 1000.0 * g_cpu_cores);
         long used_mhz  = (long)(total_mhz * g_m.cpu / 100.0);
-        swprintf(line, 160, L"CPU  %3.0f%%  %ld/%ldMHz x%lu",
+        swprintf(line, 200, L"CPU  %3.0f%%  %ld/%ldMHz x%lu",
                  g_m.cpu, used_mhz, total_mhz, g_cpu_cores);
     }
     else
-        swprintf(line, 160, L"CPU  %3.0f%%  x%lu", g_m.cpu, g_cpu_cores);
-    y = DrawMetric(dc, &rc, y, H_CPU, line, 100.0, C_CPU_L, C_CPU_F);
+        swprintf(line, 200, L"CPU  %3.0f%%  x%lu", g_m.cpu, g_cpu_cores);
+    y = DrawMetric(dc, &rc, y, H_CPU, line, 100.0, gh, C_CPU_L, C_CPU_F);
 
     /* --- RAM --- */
-    swprintf(line, 160, L"RAM  %2.0f%%  %lu/%luG",
+    swprintf(line, 200, L"RAM  %2.0f%%  %lu/%luG",
              g_m.ram, g_m.ram_used_mb >> 10, g_m.ram_total_mb >> 10);
-    y = DrawMetric(dc, &rc, y, H_RAM, line, 100.0, C_RAM_L, C_RAM_F);
+    y = DrawMetric(dc, &rc, y, H_RAM, line, 100.0, gh, C_RAM_L, C_RAM_F);
 
     /* --- GPU --- */
     if (g_m.gpu_ok)
-        swprintf(line, 160, L"GPU  %3.0f%%", g_m.gpu);
+        swprintf(line, 200, L"GPU  %3.0f%%", g_m.gpu);
     else
-        swprintf(line, 160, L"GPU   n/a");
-    y = DrawMetric(dc, &rc, y, H_GPU, line, 100.0, C_GPU_L, C_GPU_F);
+        swprintf(line, 200, L"GPU   n/a");
+    y = DrawMetric(dc, &rc, y, H_GPU, line, 100.0, gh, C_GPU_L, C_GPU_F);
 
     /* --- VRAM --- */
     if (g_m.vram_ok && g_vram_total_mb > 0)
-        swprintf(line, 160, L"VRAM %.1f/%.0fG", g_m.vram_mb / 1024.0,
+        swprintf(line, 200, L"VRAM %.1f/%.0fG", g_m.vram_mb / 1024.0,
                  g_vram_total_mb / 1024.0);
     else if (g_m.vram_ok)
-        swprintf(line, 160, L"VRAM %.1fG", g_m.vram_mb / 1024.0);
+        swprintf(line, 200, L"VRAM %.1fG", g_m.vram_mb / 1024.0);
     else
-        swprintf(line, 160, L"VRAM  n/a");
-    {
-        double vpct = 0;
-        if (g_m.vram_ok && g_vram_total_mb > 0)
-            vpct = 100.0 * g_m.vram_mb / g_vram_total_mb;
-        y = DrawMetric(dc, &rc, y, H_VRAM, line, 100.0, C_VRAM_L, C_VRAM_F);
-        (void)vpct;
-    }
+        swprintf(line, 200, L"VRAM  n/a");
+    y = DrawMetric(dc, &rc, y, H_VRAM, line, 100.0, gh, C_VRAM_L, C_VRAM_F);
 
     /* --- DSK: two series (R bright, W dimmer), adaptive scale --- */
     if (g_m.disk_ok) {
@@ -1038,21 +1073,21 @@ static void DrawWindow(HDC dc, HWND hwnd)
         }
         g_scale_disk = peak * 1.25 > g_scale_disk ? peak * 1.25
                                                    : g_scale_disk * 0.97;
-        swprintf(line, 160, L"DSK  R %4.0f  W %4.0f K/s",
+        swprintf(line, 200, L"DSK  R %4.0f  W %4.0f K/s",
                  g_m.disk_r_kbps, g_m.disk_w_kbps);
     }
     else
-        swprintf(line, 160, L"DSK   n/a");
+        swprintf(line, 200, L"DSK   n/a");
     {
         RECT gr;
         SetTextColor(dc, C_DSKR_L);
         TextOutW(dc, PAD, y, line, (int)wcslen(line));
         y += LINE_H;
         gr.left = PAD + 2;  gr.top = y + 3;
-        gr.right = rc.right - PAD - 2;  gr.bottom = y + GRAPH_H - 2;
+        gr.right = rc.right - PAD - 2;  gr.bottom = y + gh - 2;
         DrawSeries(dc, &gr, H_DISK_W, g_scale_disk, C_DSKW_L, C_DSK_F);
         DrawSeries(dc, &gr, H_DISK_R, g_scale_disk, C_DSKR_L, C_DSK_F);
-        y += GRAPH_H + GAP;
+        y += gh + GAP;
     }
 
     /* --- NET: two series (down, up), adaptive scale; totals under it --- */
@@ -1065,18 +1100,18 @@ static void DrawWindow(HDC dc, HWND hwnd)
         }
         g_scale_net = peak * 1.25 > g_scale_net ? peak * 1.25 : g_scale_net * 0.97;
 
-        swprintf(line, 160, L"NET  v %4.0f  ^ %4.0f K/s",
+        swprintf(line, 200, L"NET  v %4.0f  ^ %4.0f K/s",
                  g_m.net_down_kbps, g_m.net_up_kbps);
         SetTextColor(dc, C_NETD_L);
         TextOutW(dc, PAD, y, line, (int)wcslen(line));
         y += LINE_H;
         gr.left = PAD + 2;  gr.top = y + 3;
-        gr.right = rc.right - PAD - 2;  gr.bottom = y + GRAPH_H - 2;
+        gr.right = rc.right - PAD - 2;  gr.bottom = y + gh - 2;
         DrawSeries(dc, &gr, H_NET_U, g_scale_net, C_NETU_L, C_NET_F);
         DrawSeries(dc, &gr, H_NET_D, g_scale_net, C_NETD_L, C_NET_F);
-        y += GRAPH_H;
+        y += gh;
 
-        swprintf(line, 160, L"     in %-8ls  out %-8ls", bin, bout);
+        swprintf(line, 200, L"     in %-8ls  out %-8ls", bin, bout);
         SetTextColor(dc, C_SEP);
         TextOutW(dc, PAD, y, line, (int)wcslen(line));
         y += LINE_H + GAP;
@@ -1091,13 +1126,14 @@ static void DrawWindow(HDC dc, HWND hwnd)
     TextOutW(dc, PAD, y, L"TOP PROCESSES", 13); y += LINE_H;
 
     SelectObject(dc, g_font_proc);
-    for (int i = 0; i < g_top_count; i++) {
+    for (int i = 0; i < procs_drawn; i++) {
         if (g_top[i].cpu >= 70)      SetTextColor(dc, RGB(250, 120, 110));
         else if (g_top[i].cpu >= 30) SetTextColor(dc, RGB(240, 170, 120));
         else                         SetTextColor(dc, RGB(210, 220, 230));
         /* shortened path spans the window; exe name sits at its tail */
-        swprintf(line, 160, L"%-40.40ls %3.0f%% %5luM",
-                 g_top[i].path, g_top[i].cpu, (unsigned long)g_top[i].ram_mb);
+        swprintf(line, 200, L"%-*.*ls %3.0f%% %5luM",
+                 pathw, pathw, g_top[i].path, g_top[i].cpu,
+                 (unsigned long)g_top[i].ram_mb);
         TextOutW(dc, PAD, y, line, (int)wcslen(line));
         y += LINE_H;
     }
@@ -1111,7 +1147,7 @@ static void DrawWindow(HDC dc, HWND hwnd)
     SetTextColor(dc, C_SEP);
     TextOutW(dc, PAD, y, L"TOP CONNECTIONS", 15); y += LINE_H;
 
-    ConnDraw(dc, y);
+    ConnDraw(dc, y, rows);
 }
 
 /* ---------------- window ---------------- */
@@ -1144,9 +1180,13 @@ static void ShowMenu(HWND hwnd)
     case 1: ToggleClickThrough(hwnd); break;
     case 2: SetAutoStart(!GetAutoStart()); break;
     case 3:
+        /* reset both position AND size back to the DPI-derived defaults */
         g_wnd_pos.x = -1; g_wnd_pos.y = -1;
-        LoadSettings();
-        SetWindowPos(hwnd, 0, g_wnd_pos.x, g_wnd_pos.y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+        g_wnd_cx = g_def_cx; g_wnd_cy = g_def_cy;
+        SaveSettings();
+        LoadSettings();          /* re-docks with default size */
+        SetWindowPos(hwnd, 0, g_wnd_pos.x, g_wnd_pos.y,
+                     g_wnd_cx, g_wnd_cy, SWP_NOZORDER);
         break;
     case 4:
         Shell_NotifyIconW(NIM_DELETE, &g_nid);
@@ -1166,6 +1206,48 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     switch (msg) {
     case WM_CREATE:
         SetTimer(hwnd, TIMER_ID, INTERVAL_MS, NULL);
+        return 0;
+    case WM_NCHITTEST: {
+        /* resize grips on the right/bottom edges — only reachable when
+         * click-through is off (transparent windows never see the mouse) */
+        POINT pt;
+        RECT rc;
+        int edge = 8;
+        if (g_click_through) break;
+        pt.x = (short)LOWORD(lp);
+        pt.y = (short)HIWORD(lp);
+        ScreenToClient(hwnd, &pt);
+        GetClientRect(hwnd, &rc);
+        if (pt.x >= rc.right - edge && pt.y >= rc.bottom - edge)
+            return HTBOTTOMRIGHT;
+        if (pt.x >= rc.right - edge) return HTRIGHT;
+        if (pt.y >= rc.bottom - edge) return HTBOTTOM;
+        break;
+    }
+    case WM_SIZING: {
+        /* enforce min size while the user drags an edge */
+        RECT *pr = (RECT *)lp;
+        if (pr->right - pr->left < g_min_cx) {
+            if (wp == WMSZ_LEFT || wp == WMSZ_TOPLEFT || wp == WMSZ_BOTTOMLEFT)
+                pr->left = pr->right - g_min_cx;
+            else
+                pr->right = pr->left + g_min_cx;
+        }
+        if (pr->bottom - pr->top < g_min_cy) {
+            if (wp == WMSZ_TOP || wp == WMSZ_TOPLEFT || wp == WMSZ_TOPRIGHT)
+                pr->top = pr->bottom - g_min_cy;
+            else
+                pr->bottom = pr->top + g_min_cy;
+        }
+        return TRUE;
+    }
+    case WM_SIZE:
+        g_wnd_cx = LOWORD(lp);
+        g_wnd_cy = HIWORD(lp);
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+    case WM_EXITSIZEMOVE:
+        SaveSettings();      /* position already saved by the drag handler */
         return 0;
     case WM_TIMER:
         QueryCPU();
@@ -1231,9 +1313,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         /* resolution / monitor change: pull a saved-off-screen position back */
         int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
         int x = g_wnd_pos.x, y = g_wnd_pos.y;
-        if (x > sw - WND_W - 16) x = sw - WND_W - 16;
+        if (x > sw - g_wnd_cx - 16) x = sw - g_wnd_cx - 16;
         if (x < 0) x = 0;
-        if (y > sh - WND_H - 16) y = sh - WND_H - 16;
+        if (y > sh - g_wnd_cy - 16) y = sh - g_wnd_cy - 16;
         if (y < 0) y = 0;
         if (x != g_wnd_pos.x || y != g_wnd_pos.y) {
             g_wnd_pos.x = x; g_wnd_pos.y = y;
@@ -1277,13 +1359,19 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
         PAD     = (int)(8.0  * k + 0.5);
         GRAPH_H = (int)(32.0 * k + 0.5);
         GAP     = (int)(6.0  * k + 0.5);
-        WND_W   = (int)(500.0 * k + 0.5);   /* wide enough for the
-                                             * conn rows' byte columns */
-        WND_H   = PAD * 2
-                + 6 * (LINE_H + GRAPH_H + GAP)   /* metric line + graph  */
-                + LINE_H                          /* NET totals           */
-                + LINE_H + TOP_N * LINE_H         /* TOP PROCESSES        */
-                + LINE_H + CONN_N * LINE_H;       /* TOP CONNECTIONS      */
+        /* default size: wide enough for the conn rows' byte columns and
+         * tall enough for 15+15 list rows; user-resizable beyond this */
+        g_def_cx = (int)(500.0 * k + 0.5);
+        g_def_cy = PAD * 2
+                 + 6 * (LINE_H + GRAPH_H + GAP)   /* metric line + graph  */
+                 + LINE_H                          /* NET totals           */
+                 + LINE_H + 15 * LINE_H            /* TOP PROCESSES        */
+                 + LINE_H + 15 * LINE_H;           /* TOP CONNECTIONS      */
+        g_min_cx = (int)(460.0 * k + 0.5);
+        g_min_cy = PAD + 6 * (LINE_H + GRAPH_H + GAP) + LINE_H + GAP
+                 + 2 * (LINE_H + ROWS_MIN * LINE_H) + PAD;
+        g_wnd_cx = g_def_cx;
+        g_wnd_cy = g_def_cy;
     }
 
     /* per-metric palette: label text == sparkline color */
@@ -1308,9 +1396,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
      * the widget off-screen forever — clamp into the current screen */
     {
         int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
-        if (g_wnd_pos.x > sw - WND_W)     g_wnd_pos.x = sw - WND_W - 16;
+        if (g_wnd_cy > sh - 16) g_wnd_cy = sh - 16;      /* size clamp too */
+        if (g_wnd_cx > sw)      g_wnd_cx = sw;
+        if (g_wnd_pos.x > sw - g_wnd_cx) g_wnd_pos.x = sw - g_wnd_cx - 16;
         if (g_wnd_pos.x < 0)              g_wnd_pos.x = 0;
-        if (g_wnd_pos.y > sh - WND_H)     g_wnd_pos.y = sh - WND_H - 16;
+        if (g_wnd_pos.y > sh - g_wnd_cy)  g_wnd_pos.y = sh - g_wnd_cy - 16;
         if (g_wnd_pos.y < 0)              g_wnd_pos.y = 0;
     }
 
@@ -1337,7 +1427,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     hwnd = CreateWindowExW(
         WS_EX_LAYERED | WS_EX_TOOLWINDOW,
         APP_NAME, APP_NAME, WS_POPUP | WS_VISIBLE,
-        g_wnd_pos.x, g_wnd_pos.y, WND_W, WND_H,
+        g_wnd_pos.x, g_wnd_pos.y, g_wnd_cx, g_wnd_cy,
         desk, NULL, inst, NULL);
     if (!hwnd) return 1;
 
@@ -1357,6 +1447,16 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     g_font_proc = CreateFontW(-(LINE_H - 6), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET,
                          OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                          CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_MODERN, L"Consolas");
+    /* measure the real monospace advance width for dynamic column sizing */
+    {
+        HDC dc = GetDC(hwnd);
+        HGDIOBJ old = SelectObject(dc, g_font_proc);
+        TEXTMETRICW tm;
+        GetTextMetricsW(dc, &tm);
+        g_char_w = tm.tmAveCharWidth ? tm.tmAveCharWidth : 9;
+        SelectObject(dc, old);
+        ReleaseDC(hwnd, dc);
+    }
 
     ZeroMemory(&g_nid, sizeof g_nid);
     g_nid.cbSize = sizeof g_nid;
@@ -1365,7 +1465,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_nid.uCallbackMessage = WM_TRAYICON;
     g_nid.hIcon = LoadIconW(NULL, (LPCWSTR)IDI_APPLICATION);
-    wcscpy(g_nid.szTip, L"SysGlance 1.2 — system monitor (right-click)");
+    wcscpy(g_nid.szTip, L"SysGlance 1.4 — system monitor (right-click)");
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {

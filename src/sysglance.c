@@ -284,21 +284,10 @@ static void SetAutoStart(BOOL enable)
 
 static BOOL GetAutoStart(void)
 {
-    SHELLEXECUTEINFOW sei;
-    ZeroMemory(&sei, sizeof sei);
-    sei.cbSize = sizeof sei;
-    sei.fMask = SEE_MASK_NOASYNC;    /* synchronous */
-    sei.lpFile = L"schtasks";
-    sei.lpParameters = L"/Query /TN \"SysGlance\"";
-    sei.nShow = SW_HIDE;
-    if (!ShellExecuteExW(&sei)) return FALSE;
-    WaitForSingleObject(sei.hProcess, 5000);
-    {
-        DWORD code = 1;
-        GetExitCodeProcess(sei.hProcess, &code);
-        CloseHandle(sei.hProcess);
-        return code == 0;
-    }
+    /* exit code 0 == task exists. (The earlier ShellExecuteExW version
+     * lacked SEE_MASK_NOCLOSEPROCESS, so hProcess was always NULL and
+     * this wrongly reported "off" — the menu tick never showed.) */
+    return RunWaitHidden(L"schtasks /Query /TN \"SysGlance\"");
 }
 
 
@@ -1353,19 +1342,35 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         break;
     }
     case WM_SIZING: {
-        /* enforce min size while the user drags an edge */
+        /* enforce min size and keep the widget on screen while dragging */
         RECT *pr = (RECT *)lp;
+        int sw = GetSystemMetrics(SM_CXSCREEN);
+        int sh = GetSystemMetrics(SM_CYSCREEN);
+        int max_cx = sw - 16;
+        int max_cy = sh - 48;          /* leave room for the taskbar */
         if (pr->right - pr->left < g_min_cx) {
             if (wp == WMSZ_LEFT || wp == WMSZ_TOPLEFT || wp == WMSZ_BOTTOMLEFT)
                 pr->left = pr->right - g_min_cx;
             else
                 pr->right = pr->left + g_min_cx;
         }
+        if (pr->right - pr->left > max_cx) {
+            if (wp == WMSZ_RIGHT || wp == WMSZ_TOPRIGHT || wp == WMSZ_BOTTOMRIGHT)
+                pr->right = pr->left + max_cx;
+            else
+                pr->left = pr->right - max_cx;
+        }
         if (pr->bottom - pr->top < g_min_cy) {
             if (wp == WMSZ_TOP || wp == WMSZ_TOPLEFT || wp == WMSZ_TOPRIGHT)
                 pr->top = pr->bottom - g_min_cy;
             else
                 pr->bottom = pr->top + g_min_cy;
+        }
+        if (pr->bottom - pr->top > max_cy) {
+            if (wp == WMSZ_BOTTOM || wp == WMSZ_BOTTOMLEFT || wp == WMSZ_BOTTOMRIGHT)
+                pr->bottom = pr->top + max_cy;
+            else
+                pr->top = pr->bottom - max_cy;
         }
         return TRUE;
     }
